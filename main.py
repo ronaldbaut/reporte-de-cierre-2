@@ -50,7 +50,8 @@ async def on_message(message):
     content = message.content.strip().lower()
     channel_id = str(message.channel.id)
 
-    if content in ["cancelar", "cancelar reporte"]:
+    # Detección mejorada de cancelar (funciona aunque escribas más texto)
+    if "cancelar" in content:
         if channel_id in conversation_state:
             del conversation_state[channel_id]
             await message.channel.send("✅ Reporte cancelado.")
