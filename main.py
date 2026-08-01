@@ -26,15 +26,38 @@ client = OpenAI(
 
 conversation_state = {}
 
+# ================== LISTA DE PREGUNTAS ==================
+PREGUNTAS = [
+    "1. ¿Qué trabajadores alistaron los pedidos?",
+    "2. ¿A qué clientes pertenecen los pedidos que se alistaron?",
+    "3. ¿Cómo quedaron los pedidos? (cuáles se completaron, cuáles quedaron pendientes, observaciones relevantes y cualquier ajuste para Producción mañana). En caso de que hayan pedidos incompletos, explica por qué quedaron incompletos.",
+    "4. ¿En qué congeladores quedaron cuáles pedidos?",
+    "5. ¿A qué hora se comenzaron a alistar los pedidos y a qué hora terminaron?",
+    "6. ¿A qué hora empezaste y terminaste el envasado de bandejas? ¿Qué trabajadores se encargaron?",
+    "7. ¿A qué hora empezaste y terminaste el envasado de vasitos? ¿Qué trabajadores se encargaron del envasado de vasitos?",
+    "8. ¿Cuántos vasitos se envasaron en total hoy?",
+    "9. ¿A qué hora empezaste y terminaste la limpieza? ¿Qué trabajadores se encargaron?",
+    "10. ¿Limpiaste los tambores de las batidoras y retiraste la sal de los cabezotes?",
+    "11. ¿Cuánto gasoil tiene ahora la planta azul y cuál es el nivel de aceite?",
+    "12. ¿Cuánto gasoil tiene ahora la planta roja y cuál es el nivel de aceite?",
+    "13. ¿Todos los motores de los congeladores están encendidos, bien cerrados y calientes?",
+    "14. ¿Cerraste con candado las puertas de los heladeros, el estacionamiento, la planta y la salida (con doble candado)?",
+    "15. ¿Quedó apagado el aire acondicionado de producción y el de ventas?",
+    "16. ¿Quedó registrada la producción del día completa en la hoja de cálculo correspondiente? ¿Quién lo hizo?",
+    "17. ¿Oprimiste el botón rojo del tablero de batidoras?",
+    "18. ¿Dejaron todas las luces de la fábrica apagadas?",
+    "19. ¿Qué cantidad de gasoil hay en el depósito?"
+]
+
 # ================== COMANDO SLASH ==================
 @bot.tree.command(name="reporte-cierre", description="Inicia el Reporte de Cierre")
 async def reporte_cierre_slash(interaction: discord.Interaction):
     channel = interaction.channel
-    conversation_state[str(channel.id)] = {"tipo": "cierre", "paso": 1}
+    conversation_state[str(channel.id)] = {"paso": 0}
     await interaction.response.send_message(
-        "**Reporte de Cierre iniciado.**\n\n"
-        "1. ¿Qué trabajadores alistaron los pedidos?\n\n"
-        "_Escribe **cancelar** o **cancelar reporte** en cualquier momento para detenerlo._"
+        f"**Reporte de Cierre iniciado.**\n\n"
+        f"{PREGUNTAS[0]}\n\n"
+        f"_Escribe **cancelar** o **cancelar reporte** en cualquier momento para detenerlo._"
     )
 
 @bot.event
@@ -55,96 +78,104 @@ async def on_message(message):
     content = message.content.strip().lower()
     channel_id = str(message.channel.id)
 
-    # Detección mejorada de cancelar
-    if "cancelar" in content:
+    # Cancelación flexible
+    if any(palabra in content for palabra in ["cancelar", "canelar", "cancel", "cancela", "cancelar reporte", "canelar reporte"]):
         if channel_id in conversation_state:
             del conversation_state[channel_id]
             await message.channel.send("✅ Reporte cancelado.")
         return
 
     if content in ["reporte de cierre", "iniciar reporte de cierre"]:
-        await iniciar_reporte_cierre(message.channel)
-    elif channel_id in conversation_state:
+        conversation_state[channel_id] = {"paso": 0}
+        await message.channel.send(
+            f"**Reporte de Cierre iniciado.**\n\n"
+            f"{PREGUNTAS[0]}\n\n"
+            f"_Escribe **cancelar** o **cancelar reporte** en cualquier momento para detenerlo._"
+        )
+        return
+
+    if channel_id in conversation_state:
         await manejar_respuesta(message)
 
-# ================== INICIO DEL REPORTE ==================
-async def iniciar_reporte_cierre(channel):
-    conversation_state[str(channel.id)] = {"tipo": "cierre", "paso": 1}
-    await channel.send(
-        "**Reporte de Cierre iniciado.**\n\n"
-        "1. ¿Qué trabajadores alistaron los pedidos?\n\n"
-        "_Escribe **cancelar** o **cancelar reporte** en cualquier momento para detenerlo._"
-    )
+# ================== FUNCIÓN QUE CONSULTA A GROK ==================
+async def consultar_grok(pregunta: str, respuesta_usuario: str) -> dict:
+    system_prompt = """
+Eres un supervisor estricto de reportes de cierre de una fábrica de helados.
+
+Responde ÚNICAMENTE con un JSON válido:
+
+{
+  "respuesta_valida": true o false,
+  "mensaje": null o "texto"
+}
+
+Reglas:
+- Si la respuesta es muy corta, vacía, irrelevante o no responde claramente la pregunta → respuesta_valida = false
+- Cuando sea inválida, el campo "mensaje" debe decir de forma clara, simple y contundente qué falta.
+  Ejemplos:
+  - "Te falta decirme los nombres de los trabajadores."
+  - "No me dijiste a qué hora empezaron y terminaron."
+  - "Responde completo lo que se te preguntó."
+- Sé directo y corto.
+- Si la respuesta es válida, pon "mensaje": null
+"""
+
+    user_content = f"""
+Pregunta actual:
+{pregunta}
+
+Respuesta del trabajador:
+"{respuesta_usuario}"
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model="grok-4-1-fast",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"}
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        print(f"Error al consultar Grok: {e}")
+        return {
+            "respuesta_valida": True,
+            "mensaje": None
+        }
 
 # ================== MANEJO DE RESPUESTAS ==================
 async def manejar_respuesta(message):
     channel_id = str(message.channel.id)
     state = conversation_state[channel_id]
-    tipo = state["tipo"]
+    
+    pregunta_actual = PREGUNTAS[state["paso"]]
+    
+    # Reacción en vez de mensaje ✅
+    try:
+        await message.add_reaction("✅")
+    except:
+        pass
 
-    # Solo el emoji de check, nada más
-    await message.channel.send("✅")
+    # Consultamos a Grok
+    decision = await consultar_grok(pregunta_actual, message.content)
 
-    if tipo == "cierre":
-        paso = state["paso"]
+    # Si la respuesta no es válida → regaño y no avanzamos
+    if not decision.get("respuesta_valida", True):
+        mensaje = decision.get("mensaje") or "Tu respuesta está incompleta. Responde correctamente lo que se te preguntó."
+        await message.channel.send(mensaje)
+        return
 
-        if paso == 1:
-            state["paso"] = 2
-            await message.channel.send("2. ¿A qué clientes pertenecen los pedidos que se alistaron?")
-        elif paso == 2:
-            state["paso"] = 3
-            await message.channel.send("3. ¿Cómo quedaron los pedidos? (cuáles se completaron, cuáles quedaron pendientes, observaciones relevantes y cualquier ajuste para Producción mañana). En caso de que hayan pedidos incompletos, explica por qué quedaron incompletos.")
-        elif paso == 3:
-            state["paso"] = 4
-            await message.channel.send("4. ¿En qué congeladores quedaron cuáles pedidos?")
-        elif paso == 4:
-            state["paso"] = 5
-            await message.channel.send("5. ¿A qué hora se comenzaron a alistar los pedidos y a qué hora terminaron?")
-        elif paso == 5:
-            state["paso"] = 6
-            await message.channel.send("6. ¿A qué hora empezaste y terminaste el envasado de bandejas? ¿Qué trabajadores se encargaron?")
-        elif paso == 6:
-            state["paso"] = 7
-            await message.channel.send("7. ¿A qué hora empezaste y terminaste el envasado de vasitos? ¿Qué trabajadores se encargaron del envasado de vasitos?")
-        elif paso == 7:
-            state["paso"] = 8
-            await message.channel.send("8. ¿Cuántos vasitos se envasaron en total hoy?")
-        elif paso == 8:
-            state["paso"] = 9
-            await message.channel.send("9. ¿A qué hora empezaste y terminaste la limpieza? ¿Qué trabajadores se encargaron?")
-        elif paso == 9:
-            state["paso"] = 10
-            await message.channel.send("10. ¿Limpiaste los tambores de las batidoras y retiraste la sal de los cabezotes?")
-        elif paso == 10:
-            state["paso"] = 11
-            await message.channel.send("11. ¿Cuánto gasoil tiene ahora la planta azul y cuál es el nivel de aceite?")
-        elif paso == 11:
-            state["paso"] = 12
-            await message.channel.send("12. ¿Cuánto gasoil tiene ahora la planta roja y cuál es el nivel de aceite?")
-        elif paso == 12:
-            state["paso"] = 13
-            await message.channel.send("13. ¿Todos los motores de los congeladores están encendidos, bien cerrados y calientes?")
-        elif paso == 13:
-            state["paso"] = 14
-            await message.channel.send("14. ¿Cerraste con candado las puertas de los heladeros, el estacionamiento, la planta y la salida (con doble candado)?")
-        elif paso == 14:
-            state["paso"] = 15
-            await message.channel.send("15. ¿Quedó apagado el aire acondicionado de producción y el de ventas?")
-        elif paso == 15:
-            state["paso"] = 16
-            await message.channel.send("16. ¿Quedó registrada la producción del día completa en la hoja de cálculo correspondiente? ¿Quién lo hizo?")
-        elif paso == 16:
-            state["paso"] = 17
-            await message.channel.send("17. ¿Oprimiste el botón rojo del tablero de batidoras?")
-        elif paso == 17:
-            state["paso"] = 18
-            await message.channel.send("18. ¿Dejaron todas las luces de la fábrica apagadas?")
-        elif paso == 18:
-            state["paso"] = 19
-            await message.channel.send("19. ¿Qué cantidad de gasoil hay en el depósito?")
-        else:
-            await message.channel.send("✅ Reporte de Cierre completado. ¡Gracias!")
-            del conversation_state[channel_id]
+    # ===== Respuesta válida → avanzamos =====
+    state["paso"] += 1
+    
+    if state["paso"] < len(PREGUNTAS):
+        await message.channel.send(PREGUNTAS[state["paso"]])
+    else:
+        await message.channel.send("✅ **Reporte de Cierre completado.** ¡Gracias!")
+        del conversation_state[channel_id]
 
 # ================== INICIO DEL BOT ==================
 bot.run(DISCORD_TOKEN)
