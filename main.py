@@ -2,12 +2,13 @@ import discord
 from discord.ext import commands
 import os
 import traceback
+from openai import OpenAI
+import json
 
 print(">>> Iniciando bot de Reporte de Cierre...")
 
 # ================== CONFIGURACIÓN ==================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-
 if not DISCORD_TOKEN:
     raise RuntimeError("❌ ERROR: Falta la variable de entorno DISCORD_TOKEN")
 
@@ -16,6 +17,12 @@ intents.message_content = True
 intents.messages = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Cliente de xAI (Grok)
+client = OpenAI(
+    api_key=os.getenv("XAI_API_KEY"),
+    base_url="https://api.x.ai/v1"
+)
 
 conversation_state = {}
 
@@ -30,7 +37,6 @@ async def reporte_cierre_slash(interaction: discord.Interaction):
         "_Escribe **cancelar** o **cancelar reporte** en cualquier momento para detenerlo._"
     )
 
-
 @bot.event
 async def on_ready():
     print(f'✅ Bot conectado como {bot.user}')
@@ -41,7 +47,6 @@ async def on_ready():
         print(f"❌ Error al sincronizar comandos: {e}")
         traceback.print_exc()
 
-
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
@@ -50,7 +55,7 @@ async def on_message(message):
     content = message.content.strip().lower()
     channel_id = str(message.channel.id)
 
-    # Detección mejorada de cancelar (funciona aunque escribas más texto)
+    # Detección mejorada de cancelar
     if "cancelar" in content:
         if channel_id in conversation_state:
             del conversation_state[channel_id]
@@ -59,10 +64,8 @@ async def on_message(message):
 
     if content in ["reporte de cierre", "iniciar reporte de cierre"]:
         await iniciar_reporte_cierre(message.channel)
-
     elif channel_id in conversation_state:
         await manejar_respuesta(message)
-
 
 # ================== INICIO DEL REPORTE ==================
 async def iniciar_reporte_cierre(channel):
@@ -72,7 +75,6 @@ async def iniciar_reporte_cierre(channel):
         "1. ¿Qué trabajadores alistaron los pedidos?\n\n"
         "_Escribe **cancelar** o **cancelar reporte** en cualquier momento para detenerlo._"
     )
-
 
 # ================== MANEJO DE RESPUESTAS ==================
 async def manejar_respuesta(message):
@@ -143,7 +145,6 @@ async def manejar_respuesta(message):
         else:
             await message.channel.send("✅ Reporte de Cierre completado. ¡Gracias!")
             del conversation_state[channel_id]
-
 
 # ================== INICIO DEL BOT ==================
 bot.run(DISCORD_TOKEN)
