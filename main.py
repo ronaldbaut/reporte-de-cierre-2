@@ -5,25 +5,27 @@ import traceback
 from openai import OpenAI
 import json
 import re
- 
+from math import isfinite
+from typing import Optional
+
 print(">>> Iniciando bot de Reporte de Cierre...")
- 
+
 # ================== CONFIGURACIÓN ==================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
     raise RuntimeError("❌ ERROR: Falta la variable de entorno DISCORD_TOKEN")
- 
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.messages = True
- 
+
 bot = commands.Bot(command_prefix="!", intents=intents)
- 
+
 client = OpenAI(
     api_key=os.getenv("XAI_API_KEY"),
     base_url="https://api.x.ai/v1",
 )
- 
+
 # Estado por canal. Solo el usuario que inició puede responder.
 # {
 #   channel_id: {
@@ -35,11 +37,23 @@ client = OpenAI(
 #   }
 # }
 conversation_state = {}
- 
+
 # Índices de preguntas del bloque de pedidos (0-based)
 PEDIDOS_INICIO = 0
 PEDIDOS_FIN = 4  # preguntas 1..5 inclusive
- 
+
+# Preguntas de envasado de vasitos (0-based): 7 = horas+personas, 8 = cantidad
+IDX_VASITOS_HORAS = 6
+IDX_VASITOS_CANTIDAD = 7
+
+# Meta CMI: segundos por vasito según cuántas personas envasaron
+# 4 personas → 14 s; 3 → 18 s; 2 → 26 s. 5 o más usa la de 4.
+METAS_SEGUNDOS_POR_VASITO = {
+    2: 26,
+    3: 18,
+    4: 14,
+}
+
 # ================== PREGUNTAS + REGLAS POR PREGUNTA ==================
 # Cada item: texto que ve el trabajador + reglas que ve Grok.
 PREGUNTAS = [
@@ -110,6 +124,7 @@ PREGUNTAS = [
         "reglas": """
 - Igual que bandejas: horas + trabajadores.
 - Acepta tramos (gourmet de X a Y, trisabor de A a B).
+- Si no se envasaron vasitos hoy, "no hubo / no se envasaron" ES válido.
 """,
     },
     {
@@ -118,6 +133,7 @@ PREGUNTAS = [
 - Válido: un total numérico (729, 742 vasitos) O desglose que sume (Trisabor:415 Gourmet:434).
 - NO exijas "total" si ya dio números claros de vasitos.
 - Inválido: solo horas de envasado sin cantidad.
+- "0" / "ninguno" / "no se envasaron vasitos" ES válido.
 """,
     },
     {
@@ -143,7 +159,7 @@ PREGUNTAS = [
 - Válido: cantidad o nivel de gasoil (rayas, líneas, mitad, pimpina, número) Y algo del aceite (bien / óptimo / bajo / foto).
 - "5 rayas de gasoil y aceite bien" ES válido.
 - "Medio tanque y aceite bien" ES válido (no exijas número exacto de litros).
-- Si la planta está en uso y no puede medir, acepta esa explicación + lo que sí sepa.
+- Si la planta está en uso y no puede medir, acepta esa explicación + lo que sísepa.
 - Foto + texto corto sobre niveles ES válido.
 """,
     },
@@ -213,8 +229,8 @@ PREGUNTAS = [
 """,
     },
 ]
- 
- 
+
+
 # ================== HELPERS ==================
 def _vacio_o_basura(texto: str, tiene_adjuntos: bool) -> bool:
     t = (texto or "").strip()
@@ -224,8 +240,8 @@ def _vacio_o_basura(texto: str, tiene_adjuntos: bool) -> bool:
         return True
     basura = {".", "..", "...", "ok", "vale", "listo", "k", "ya", "-", "—"}
     return t.lower() in basura
- 
- 
+
+
 def _parece_cancelar(content_lower: str) -> bool:
     # Solo frases de cancelación, no cualquier palabra suelta en un párrafo largo
     patrones = [
@@ -237,8 +253,8 @@ def _parece_cancelar(content_lower: str) -> bool:
         r"^detener(\s+reporte)?$",
     ]
     return any(re.match(p, content_lower) for p in patrones)
- 
- 
+
+
 def _parece_inicio(content_lower: str) -> bool:
     return content_lower in {
         "reporte de cierre",
@@ -246,16 +262,300 @@ def _parece_inicio(content_lower: str) -> bool:
         "inicio reporte de cierre",
         "/reporte-cierre",
     }
- 
- 
+
+
 def _saltar_resto_pedidos(state: dict) -> None:
     """Si no hubo pedidos, salta a la pregunta 6 (índice 5)."""
     state["sin_pedidos"] = True
     if state["paso"] <= PEDIDOS_FIN:
         state["paso"] = PEDIDOS_FIN + 1
         state["buffer"] = ""
- 
- 
+
+
+# ================== CÁLCULO ENVASADO VASITOS ==================
+def _a_minutos(hora: str) -> Optional[int]:
+    """Convierte '15:20', '3:20pm', '3.20 p.m.' a minutos desde medianoche."""
+    if not hora or not str(hora).strip():
+        return None
+    s = str(hora).strip().lower()
+    s = s.replace(" ", "")
+    s = s.replace("p.m.", "pm").replace("a.m.", "am")
+    s = s.replace("p.m", "pm").replace("a.m", "am")
+    mer = None
+    if s.endswith("pm"):
+        mer = "pm"
+        s = s[:-2]
+    elif s.endswith("am"):
+        mer = "am"
+        s = s[:-2]
+    s = s.replace(".", ":").replace("h", ":")
+    parts = [p for p in s.split(":") if p != ""]
+    if not parts:
+        return None
+    try:
+        h = int(parts[0])
+        m = int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        return None
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        return None
+    if mer == "pm" and h < 12:
+        h += 12
+    elif mer == "am" and h == 12:
+        h = 0
+    elif mer is None and 1 <= h <= 7:
+        # Envasado es turno tarde: 3:20 → 15:20
+        h += 12
+    return h * 60 + m
+
+
+def _duracion_minutos(inicio: str, fin: str) -> Optional[int]:
+    t0 = _a_minutos(inicio)
+    t1 = _a_minutos(fin)
+    if t0 is None or t1 is None:
+        return None
+    if t1 <= t0:
+        t1 += 12 * 60
+        if t1 <= t0:
+            t1 += 12 * 60
+    return t1 - t0
+
+
+def _fmt_duracion(minutos: float) -> str:
+    total = max(0, int(round(minutos)))
+    h, m = divmod(total, 60)
+    if h and m:
+        return f"{h} h {m} min"
+    if h:
+        return f"{h} h"
+    return f"{m} min"
+
+
+def _fmt_segundos_vasito(valor: float) -> str:
+    if abs(valor - round(valor)) < 0.05:
+        return str(int(round(valor)))
+    return f"{valor:.1f}".replace(".", ",")
+
+
+def _meta_para_personas(n: int) -> Optional[int]:
+    if n >= 4:
+        return METAS_SEGUNDOS_POR_VASITO[4]
+    return METAS_SEGUNDOS_POR_VASITO.get(n)
+
+
+def calcular_envasado_vasitos(datos: dict) -> Optional[dict]:
+    """
+    datos extraídos por Grok:
+      hubo_envasado, vasitos, n_trabajadores, trabajadores, tramos[{inicio,fin,pausa_minutos}]
+    El promedio es tiempo de reloj / vasitos (no minutos-persona).
+    """
+    if not datos or not datos.get("hubo_envasado", True):
+        return None
+
+    try:
+        vasitos = int(round(float(str(datos.get("vasitos", 0)).replace(",", "."))))
+    except (TypeError, ValueError):
+        vasitos = 0
+    if vasitos <= 0:
+        return {
+            "ok": False,
+            "motivo": "no_vasitos",
+            "mensaje": "No se envasaron vasitos hoy: no hay promedio que calcular.",
+        }
+
+    n = datos.get("n_trabajadores")
+    try:
+        n = int(n) if n is not None else 0
+    except (TypeError, ValueError):
+        n = 0
+    nombres = datos.get("trabajadores") or []
+    if isinstance(nombres, str):
+        nombres = [nombres]
+    nombres = [str(x).strip() for x in nombres if str(x).strip()]
+    if n <= 0:
+        n = len(nombres)
+
+    minutos = 0.0
+    tramos_ok = []
+    for tramo in datos.get("tramos") or []:
+        if not isinstance(tramo, dict):
+            continue
+        dur = _duracion_minutos(tramo.get("inicio") or "", tramo.get("fin") or "")
+        if dur is None:
+            continue
+        try:
+            pausa = float(tramo.get("pausa_minutos") or 0)
+        except (TypeError, ValueError):
+            pausa = 0
+        neto = max(0.0, dur - pausa)
+        if neto <= 0:
+            continue
+        tramos_ok.append(neto)
+        minutos += neto
+
+    if minutos <= 0:
+        # Fallback si Grok mandó minutos_totales ya restando pausas
+        try:
+            minutos = float(datos.get("minutos_totales") or 0)
+        except (TypeError, ValueError):
+            minutos = 0
+    if minutos <= 0:
+        return {
+            "ok": False,
+            "motivo": "sin_tiempo",
+            "mensaje": (
+                "Tengo el total de vasitos, pero no pude armar el tiempo de envasado "
+                "con las horas. El promedio no se calculó."
+            ),
+        }
+
+    segundos = minutos * 60.0
+    seg_por_vasito = segundos / vasitos
+    if not isfinite(seg_por_vasito) or seg_por_vasito <= 0:
+        return {
+            "ok": False,
+            "motivo": "calculo",
+            "mensaje": "No pude calcular el promedio de segundos por vasito.",
+        }
+
+    meta = _meta_para_personas(n) if n else None
+    cumplio = None
+    if meta is not None:
+        cumplio = seg_por_vasito <= meta + 1e-9
+
+    return {
+        "ok": True,
+        "vasitos": vasitos,
+        "n_trabajadores": n,
+        "trabajadores": nombres,
+        "minutos": minutos,
+        "segundos": segundos,
+        "seg_por_vasito": seg_por_vasito,
+        "meta": meta,
+        "cumplio": cumplio,
+    }
+
+
+def formatear_calculo_envasado(calc: dict) -> str:
+    if not calc:
+        return ""
+    if not calc.get("ok"):
+        return f"📊 **Envasado de vasitos:** {calc.get('mensaje')}"
+
+    nombres = calc.get("trabajadores") or []
+    quienes = f" ({', '.join(nombres)})" if nombres else ""
+    n = calc.get("n_trabajadores") or 0
+    personas = f"{n} persona" + ("" if n == 1 else "s") + quienes
+
+    lineas = [
+        "📊 **Cálculo de envasado de vasitos**",
+        f"• Tiempo: {_fmt_duracion(calc['minutos'])} ({int(round(calc['segundos']))} s)",
+        f"• Vasitos: {calc['vasitos']}",
+        f"• Personas: {personas}",
+        f"• Promedio: **{_fmt_segundos_vasito(calc['seg_por_vasito'])} s/vasito**",
+    ]
+    meta = calc.get("meta")
+    if meta is None:
+        if n <= 0:
+            lineas.append("• Meta: no pude saber cuántas personas envasaron, no comparo contra el CMI.")
+        else:
+            lineas.append(
+                f"• Meta: el CMI no define segundos/vasito para {n} persona(s) "
+                f"(sí para 2, 3 o 4)."
+            )
+    else:
+        etiqueta_n = "4 o más" if n >= 4 else str(n)
+        lineas.append(f"• Meta ({etiqueta_n} personas): **{meta} s/vasito**")
+        diff = meta - calc["seg_por_vasito"]
+        if calc.get("cumplio"):
+            lineas.append(
+                f"✅ **Cumplieron la meta** "
+                f"({_fmt_segundos_vasito(diff)} s por debajo)."
+            )
+        else:
+            lineas.append(
+                f"❌ **No cumplieron la meta** "
+                f"({_fmt_segundos_vasito(-diff)} s por encima)."
+            )
+    return "\n".join(lineas)
+
+
+async def extraer_datos_envasado_vasitos(answers: dict) -> dict:
+    """Grok solo extrae datos; el promedio y la meta se calculan en Python."""
+    q7 = answers.get(str(IDX_VASITOS_HORAS), "")
+    q8 = answers.get(str(IDX_VASITOS_CANTIDAD), "")
+    system_prompt = """
+Eres extractor de datos de un reporte de cierre (fábrica de helados).
+NO calcules promedios ni metas. Solo extrae lo que dijeron.
+
+Responde ÚNICAMENTE JSON:
+{
+  "hubo_envasado": true o false,
+  "vasitos": número entero (0 si no hubo),
+  "n_trabajadores": número entero,
+  "trabajadores": ["Nombre", ...],
+  "tramos": [
+    {
+      "etiqueta": "gourmet" o "trisabor" o "general" o null,
+      "inicio": "HH:MM" en 24 horas,
+      "fin": "HH:MM" en 24 horas,
+      "pausa_minutos": número (0 si no hay pausa)
+    }
+  ],
+  "minutos_totales": número o null
+}
+
+Reglas:
+- Pregunta 7 = horas y quiénes envasaron VASITOS (no bandejas).
+- Pregunta 8 = cantidad de vasitos. Si hay desglose (Gourmet 434, Trisabor 415), SUMA tú el total en vasitos.
+- "729", "742 vasitos", "Trisabor:415 Gourmet:434" → vasitos numérico.
+- Horas: convierte a 24h. El envasado es de tarde: "3:20" → "15:20", "5:45pm" → "17:45".
+- Varios tramos (gourmet de X a Y, trisabor de A a B) van en "tramos" por separado.
+- Si hay pausa ("paramos 15 min", "de 4 a 4:20 no se envasó"), ponla en pausa_minutos de ese tramo o reparte.
+- minutos_totales: suma de tramos menos pausas, o null si no puedes.
+- n_trabajadores: cuántas personas distintas envasaron vasitos. "Angel, Luis y Yuselis" = 3.
+- hubo_envasado false si dijeron que no se envasaron vasitos / cero vasitos.
+- Typos y español de planta OK. No inventes horas ni nombres que no estén.
+"""
+    user_content = f"""
+Pregunta 7 (horas y trabajadores del envasado de vasitos):
+\"\"\"{q7 or "(vacío)"}\"\"\"
+
+Pregunta 8 (cantidad de vasitos):
+\"\"\"{q8 or "(vacío)"}\"\"\"
+"""
+    try:
+        response = client.chat.completions.create(
+            model="grok-4-1-fast",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(response.choices[0].message.content)
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except Exception as e:
+        print(f"Error al extraer datos de envasado: {e}")
+        traceback.print_exc()
+        return {}
+
+
+async def mensaje_calculo_envasado(state: dict) -> Optional[str]:
+    datos = await extraer_datos_envasado_vasitos(state.get("answers") or {})
+    calc = calcular_envasado_vasitos(datos)
+    if not calc:
+        return None
+    state["calculo_envasado"] = {
+        k: v for k, v in calc.items() if k != "mensaje"
+    }
+    state["calculo_envasado_datos"] = datos
+    return formatear_calculo_envasado(calc)
+
+
 async def iniciar_reporte(channel: discord.abc.Messageable, user: discord.abc.User):
     channel_id = str(channel.id)
     conversation_state[channel_id] = {
@@ -272,8 +572,8 @@ async def iniciar_reporte(channel: discord.abc.Messageable, user: discord.abc.Us
         f"_Escribe **cancelar** o **cancelar reporte** para detenerlo._\n"
         f"_Si hoy **no se alistaron pedidos**, dilo en la pregunta 1 y se saltan las 2–5._"
     )
- 
- 
+
+
 # ================== COMANDO SLASH ==================
 @bot.tree.command(name="reporte-cierre", description="Inicia el Reporte de Cierre")
 async def reporte_cierre_slash(interaction: discord.Interaction):
@@ -286,15 +586,15 @@ async def reporte_cierre_slash(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
- 
+
     await interaction.response.defer(ephemeral=True)
     await iniciar_reporte(interaction.channel, interaction.user)
     try:
         await interaction.followup.send("Reporte iniciado en el canal.", ephemeral=True)
     except Exception:
         pass
- 
- 
+
+
 @bot.event
 async def on_ready():
     print(f"✅ Bot conectado como {bot.user}")
@@ -304,17 +604,17 @@ async def on_ready():
     except Exception as e:
         print(f"❌ Error al sincronizar comandos: {e}")
         traceback.print_exc()
- 
- 
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
- 
+
     content_lower = (message.content or "").strip().lower()
     channel_id = str(message.channel.id)
     state = conversation_state.get(channel_id)
- 
+
     # --- Cancelar (solo si hay reporte y es el dueño o un admin puede forzar) ---
     if state and _parece_cancelar(content_lower):
         # Dueño siempre; otros solo si es "cancelar reporte" explícito de supervisión
@@ -323,7 +623,7 @@ async def on_message(message: discord.Message):
             del conversation_state[channel_id]
             await message.channel.send("✅ Reporte de Cierre cancelado.")
         return
- 
+
     # --- Iniciar por texto ---
     if _parece_inicio(content_lower):
         if channel_id in conversation_state:
@@ -335,19 +635,19 @@ async def on_message(message: discord.Message):
             return
         await iniciar_reporte(message.channel, message.author)
         return
- 
+
     # --- Solo procesar si hay reporte activo ---
     if not state:
         return
- 
+
     # --- Aislamiento: solo el dueño responde ---
     if message.author.id != state["user_id"]:
         # No reaccionar ni regañar: ignora mensajes de terceros (Tania, Martha, etc.)
         return
- 
+
     await manejar_respuesta(message)
- 
- 
+
+
 # ================== CONSULTA A GROK ==================
 async def consultar_grok(
     pregunta_item: dict,
@@ -360,14 +660,14 @@ async def consultar_grok(
     system_prompt = """
 Eres el validador de un reporte de cierre de una fábrica de helados (Helados R's).
 Tu trabajo es decidir si la respuesta del trabajador YA aporta lo esencial de la pregunta.
- 
+
 Responde ÚNICAMENTE con JSON válido:
 {
   "respuesta_valida": true o false,
   "mensaje": null o "texto corto pidiendo SOLO lo que falta",
   "skip_bloque_pedidos": true o false
 }
- 
+
 # Principios (OBLIGATORIOS)
 1. Sé RAZONABLE, no legalista. Evalúa si la INFORMACIÓN está, no si la frase es perfecta.
 2. Español informal de planta: "si", "iso", "se termino", "pinpinas", typos → acéptalos.
@@ -383,7 +683,7 @@ Responde ÚNICAMENTE con JSON válido:
     - respuesta_valida = true
     - skip_bloque_pedidos = true
     (salvo que la pregunta actual YA no sea del bloque de pedidos)
- 
+
 # Errores que DEBES evitar (casos reales)
 - Rechazar "3.217 pote" por "no dijiste la cantidad" cuando el número está.
 - Rechazar "medio tanque y aceite bien" pidiendo gasoil otra vez.
@@ -393,12 +693,12 @@ Responde ÚNICAMENTE con JSON válido:
 - Exigir horas de alistamiento cuando no hubo pedidos.
 - Forzar copiar "encendidos, bien cerrados y calientes" cuando dijeron "sí".
 - Entrar en bucle: pedir nombres, luego horas, luego nombres otra vez.
- 
+
 # skip_bloque_pedidos
 Pon true SOLO si la respuesta indica claramente que no hubo/no se alistaron pedidos hoy
 y aún estamos en preguntas de pedidos (1-5). Si no aplica, false.
 """
- 
+
     prev_txt = ""
     if respuestas_previas:
         lines = []
@@ -407,29 +707,29 @@ y aún estamos en preguntas de pedidos (1-5). Si no aplica, false.
             if 0 <= idx < len(PREGUNTAS):
                 lines.append(f"Q{idx + 1}: {respuestas_previas[k]}")
         prev_txt = "\n".join(lines)
- 
+
     user_content = f"""
 Pregunta actual:
 {pregunta_item["texto"]}
- 
+
 Reglas específicas de ESTA pregunta:
 {pregunta_item["reglas"]}
- 
+
 Estado: sin_pedidos_ya_detectado = {sin_pedidos}
 Tiene_adjuntos_en_este_mensaje = {tiene_adjuntos}
- 
+
 Respuestas ya aceptadas de preguntas anteriores:
 {prev_txt or "(ninguna)"}
- 
+
 BUFFER de la misma pregunta (intentos previos aún no aceptados del todo):
 \"\"\"{buffer or "(vacío)"}\"\"\"
- 
+
 Respuesta NUEVA del trabajador:
 \"\"\"{respuesta_nueva}\"\"\"
- 
+
 Evalúa BUFFER + respuesta nueva juntos. Si juntos bastan → respuesta_valida true.
 """
- 
+
     try:
         response = client.chat.completions.create(
             model="grok-4-1-fast",
@@ -463,24 +763,24 @@ Evalúa BUFFER + respuesta nueva juntos. Si juntos bastan → respuesta_valida t
             "mensaje": None,
             "skip_bloque_pedidos": False,
         }
- 
- 
+
+
 # ================== MANEJO DE RESPUESTAS ==================
 async def manejar_respuesta(message: discord.Message):
     channel_id = str(message.channel.id)
     state = conversation_state.get(channel_id)
     if not state:
         return
- 
+
     paso = state["paso"]
     if paso < 0 or paso >= len(PREGUNTAS):
         del conversation_state[channel_id]
         return
- 
+
     pregunta_item = PREGUNTAS[paso]
     texto = (message.content or "").strip()
     tiene_adjuntos = bool(message.attachments)
- 
+
     # Pre-filtro sin gastar tokens
     if _vacio_o_basura(texto, tiene_adjuntos):
         await message.channel.send(
@@ -488,19 +788,19 @@ async def manejar_respuesta(message: discord.Message):
             "Si no aplica, dilo con palabras: por ejemplo *hoy no se alistaron pedidos*."
         )
         return
- 
+
     # Acumular buffer de la pregunta actual
     if state["buffer"]:
         buffer_completo = (state["buffer"] + "\n" + texto).strip()
     else:
         buffer_completo = texto
- 
+
     # Nota de adjuntos en el texto enviado a Grok
     respuesta_para_ia = texto
     if tiene_adjuntos:
         nombres = ", ".join(a.filename for a in message.attachments)
         respuesta_para_ia = f"{texto}\n[Adjuntos: {nombres}]".strip()
- 
+
     decision = await consultar_grok(
         pregunta_item=pregunta_item,
         respuesta_nueva=respuesta_para_ia,
@@ -509,7 +809,7 @@ async def manejar_respuesta(message: discord.Message):
         sin_pedidos=state.get("sin_pedidos", False),
         tiene_adjuntos=tiene_adjuntos,
     )
- 
+
     if not decision.get("respuesta_valida", False):
         # Guardar intento parcial para no perder info en el siguiente mensaje
         state["buffer"] = buffer_completo
@@ -524,17 +824,17 @@ async def manejar_respuesta(message: discord.Message):
             mensaje = "Me falta un dato concreto de la pregunta. Complétalo en un mensaje más."
         await message.channel.send(mensaje)
         return
- 
+
     # ===== Válida =====
     try:
         await message.add_reaction("✅")
     except Exception:
         pass
- 
+
     # Guardar respuesta (buffer + nueva)
     state["answers"][str(paso)] = buffer_completo
     state["buffer"] = ""
- 
+
     # Saltar bloque pedidos si aplica
     if decision.get("skip_bloque_pedidos") and paso <= PEDIDOS_FIN:
         for i in range(paso, PEDIDOS_FIN + 1):
@@ -549,10 +849,22 @@ async def manejar_respuesta(message: discord.Message):
             f"{PREGUNTAS[state['paso']]['texto']}"
         )
         return
- 
+
     # Avanzar una pregunta
+    paso_completado = paso
     state["paso"] += 1
- 
+
+    # Con horas (Q7) + total de vasitos (Q8) ya se puede calcular la meta
+    if paso_completado == IDX_VASITOS_CANTIDAD:
+        try:
+            resumen = await mensaje_calculo_envasado(state)
+        except Exception as e:
+            print(f"Error en cálculo de envasado: {e}")
+            traceback.print_exc()
+            resumen = None
+        if resumen:
+            await message.channel.send(resumen)
+
     if state["paso"] < len(PREGUNTAS):
         await message.channel.send(PREGUNTAS[state["paso"]]["texto"])
     else:
@@ -560,10 +872,13 @@ async def manejar_respuesta(message: discord.Message):
             "✅ **Reporte de Cierre completado.** ¡Gracias!\n"
             f"_Respondido por <@{state['user_id']}>._"
         )
-        # Aquí podrías persistir state["answers"] a Notion/Sheets/archivo
-        print(f"[CIERRE OK] channel={channel_id} answers={json.dumps(state['answers'], ensure_ascii=False)}")
+        print(
+            f"[CIERRE OK] channel={channel_id} "
+            f"answers={json.dumps(state['answers'], ensure_ascii=False)} "
+            f"calculo={json.dumps(state.get('calculo_envasado'), ensure_ascii=False)}"
+        )
         del conversation_state[channel_id]
- 
- 
+
+
 # ================== INICIO ==================
 bot.run(DISCORD_TOKEN)
