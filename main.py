@@ -34,6 +34,7 @@ client = OpenAI(
 #     "answers": { "0": "...", ... },
 #     "buffer": "",          # respuestas parciales de la pregunta actual
 #     "sin_pedidos": bool,   # True si hoy no se alistaron pedidos
+#     "gasoil_azul_lineas": int,  # líneas ya respondidas de la planta azul
 #   }
 # }
 conversation_state = {}
@@ -45,6 +46,13 @@ PEDIDOS_FIN = 4  # preguntas 1..5 inclusive
 # Preguntas de envasado de vasitos (0-based): 7 = horas+personas, 8 = cantidad
 IDX_VASITOS_HORAS = 6
 IDX_VASITOS_CANTIDAD = 7
+
+# Gasoil planta azul (0-based): líneas, foto del nivel y, si hay menos de 4,
+# foto después de recargar. No desplaza los índices de pedidos ni de vasitos.
+IDX_GASOIL_AZUL_LINEAS = 10
+IDX_GASOIL_AZUL_FOTO_NIVEL = 11
+IDX_GASOIL_AZUL_FOTO_RECARGA = 12
+GASOIL_AZUL_MIN_LINEAS = 4
 
 # Meta CMI: segundos por vasito según cuántas personas envasaron
 # 4 personas → 14 s; 3 → 18 s; 2 → 26 s. 5 o más usa la de 4.
@@ -154,19 +162,34 @@ PREGUNTAS = [
 """,
     },
     {
-        "texto": "11. ¿Cuánto gasoil tiene ahora la planta azul y cuál es el nivel de aceite?",
+        "texto": "¿Cuántas líneas de gasoil tiene la planta azul?",
         "reglas": """
-- Válido: cantidad o nivel de gasoil (rayas, líneas, mitad, pimpina, número) Y algo del aceite (bien / óptimo / bajo / foto).
-- "5 rayas de gasoil y aceite bien" ES válido.
-- "Medio tanque y aceite bien" ES válido (no exijas número exacto de litros).
-- Si la planta está en uso y no puede medir, acepta esa explicación + lo que sísepa.
-- Foto + texto corto sobre niveles ES válido.
+- Válido SOLO si la respuesta es un número entero ≥ 0 (0, 1, 2, 3, 4, …).
+- Inválido: texto, decimales, negativos, "medio tanque", "5 rayas", "cinco", "4 líneas".
+- No pidas nivel de aceite: esta pregunta es solo el número de líneas.
+""",
+    },
+    {
+        "texto": "Envía una foto del nivel de gasoil de la planta azul.",
+        "reglas": """
+- Válido SOLO si hay una foto adjunta del nivel de gasoil.
+- Sin adjunto es inválido, aunque haya texto.
+- Foto sola (sin texto) ES válida.
+""",
+    },
+    {
+        "texto": "Envía una foto de la planta azul después de colocarle gasoil.",
+        "reglas": """
+- Válido SOLO si hay una foto adjunta después de recargar gasoil.
+- Sin adjunto es inválido, aunque haya texto.
+- Foto sola (sin texto) ES válida.
+- Esta pregunta solo se hace si las líneas de gasoil eran menos de 4.
 """,
     },
     {
         "texto": "12. ¿Cuánto gasoil tiene ahora la planta roja y cuál es el nivel de aceite?",
         "reglas": """
-- Igual que planta azul.
+- Válido: cantidad o nivel de gasoil (rayas, líneas, mitad, pimpina, número) Y algo del aceite (bien / óptimo / bajo / foto).
 - "Medio tanque de gasolina y aceite bien" ES válido.
 - "A la mitad del tanque y aceite bien" ES válido.
 - NO digas "no me dijiste cuánto gasoil" si ya dijo mitad / medio tanque / rayas.
@@ -270,6 +293,125 @@ def _saltar_resto_pedidos(state: dict) -> None:
     if state["paso"] <= PEDIDOS_FIN:
         state["paso"] = PEDIDOS_FIN + 1
         state["buffer"] = ""
+
+
+def _entero_no_negativo(texto: str) -> Optional[int]:
+    """Entero ≥ 0, o None si el mensaje no es solo ese número."""
+    t = (texto or "").strip()
+    if not re.fullmatch(r"\d+", t):
+        return None
+    return int(t)
+
+
+def _respuesta_con_adjuntos(texto: str, nombres_adjuntos) -> str:
+    """Mismo formato que ya se arma para la validación: texto + [Adjuntos: …]."""
+    cuerpo = (texto or "").strip()
+    if not nombres_adjuntos:
+        return cuerpo
+    nota = "[Adjuntos: " + ", ".join(nombres_adjuntos) + "]"
+    if cuerpo:
+        return f"{cuerpo}\n{nota}"
+    return nota
+
+
+def _siguiente_tras_foto_nivel_gasoil(lineas: int):
+    """Si hay menos de 4 líneas, toca la foto post-recarga. Si no, la pregunta siguiente."""
+    if lineas < GASOIL_AZUL_MIN_LINEAS:
+        return IDX_GASOIL_AZUL_FOTO_RECARGA, True
+    return IDX_GASOIL_AZUL_FOTO_RECARGA + 1, False
+
+
+async def _preguntar_o_cerrar(message: discord.Message, state: dict) -> None:
+    if state["paso"] < len(PREGUNTAS):
+        await message.channel.send(PREGUNTAS[state["paso"]]["texto"])
+        return
+    channel_id = str(message.channel.id)
+    await message.channel.send(
+        "✅ **Reporte de Cierre completado.** ¡Gracias!\n"
+        f"_Respondido por <@{state['user_id']}>._"
+    )
+    print(
+        f"[CIERRE OK] channel={channel_id} "
+        f"answers={json.dumps(state['answers'], ensure_ascii=False)} "
+        f"calculo={json.dumps(state.get('calculo_envasado'), ensure_ascii=False)}"
+    )
+    del conversation_state[channel_id]
+
+
+async def _manejar_gasoil_planta_azul(
+    message: discord.Message,
+    state: dict,
+    texto: str,
+    tiene_adjuntos: bool,
+) -> None:
+    paso = state["paso"]
+
+    if paso == IDX_GASOIL_AZUL_LINEAS:
+        n = _entero_no_negativo(texto)
+        if n is None:
+            if texto and not _vacio_o_basura(texto, False):
+                if state["buffer"]:
+                    state["buffer"] = (state["buffer"] + "\n" + texto).strip()
+                else:
+                    state["buffer"] = texto
+            await message.channel.send(
+                "Tiene que ser un número entero, 0 o más.\n\n"
+                f"{PREGUNTAS[IDX_GASOIL_AZUL_LINEAS]['texto']}"
+            )
+            return
+        try:
+            await message.add_reaction("✅")
+        except Exception:
+            pass
+        state["answers"][str(paso)] = str(n)
+        state["gasoil_azul_lineas"] = n
+        state["buffer"] = ""
+        state["paso"] = IDX_GASOIL_AZUL_FOTO_NIVEL
+        await message.channel.send(PREGUNTAS[IDX_GASOIL_AZUL_FOTO_NIVEL]["texto"])
+        return
+
+    if not tiene_adjuntos:
+        if texto and not _vacio_o_basura(texto, False):
+            if state["buffer"]:
+                state["buffer"] = (state["buffer"] + "\n" + texto).strip()
+            else:
+                state["buffer"] = texto
+        await message.channel.send(
+            "Falta la foto. Adjunta la imagen en el mensaje.\n\n"
+            f"{PREGUNTAS[paso]['texto']}"
+        )
+        return
+
+    try:
+        await message.add_reaction("✅")
+    except Exception:
+        pass
+
+    if state["buffer"]:
+        buffer_completo = (state["buffer"] + "\n" + texto).strip()
+    else:
+        buffer_completo = texto
+    nombres = [a.filename for a in message.attachments]
+    state["answers"][str(paso)] = _respuesta_con_adjuntos(buffer_completo, nombres)
+    state["buffer"] = ""
+
+    if paso == IDX_GASOIL_AZUL_FOTO_NIVEL:
+        lineas = state.get("gasoil_azul_lineas")
+        if lineas is None:
+            lineas = _entero_no_negativo(
+                state["answers"].get(str(IDX_GASOIL_AZUL_LINEAS), "")
+            )
+        if lineas is None:
+            lineas = 0
+        siguiente, avisar = _siguiente_tras_foto_nivel_gasoil(lineas)
+        state["paso"] = siguiente
+        if avisar:
+            await message.channel.send("Debes colocarle gasoil a la planta azul.")
+        await _preguntar_o_cerrar(message, state)
+        return
+
+    state["paso"] += 1
+    await _preguntar_o_cerrar(message, state)
 
 
 # ================== CÁLCULO ENVASADO VASITOS ==================
@@ -780,6 +922,14 @@ async def manejar_respuesta(message: discord.Message):
     pregunta_item = PREGUNTAS[paso]
     texto = (message.content or "").strip()
     tiene_adjuntos = bool(message.attachments)
+
+    if paso in (
+        IDX_GASOIL_AZUL_LINEAS,
+        IDX_GASOIL_AZUL_FOTO_NIVEL,
+        IDX_GASOIL_AZUL_FOTO_RECARGA,
+    ):
+        await _manejar_gasoil_planta_azul(message, state, texto, tiene_adjuntos)
+        return
 
     # Pre-filtro sin gastar tokens
     if _vacio_o_basura(texto, tiene_adjuntos):
