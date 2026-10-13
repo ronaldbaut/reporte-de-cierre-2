@@ -54,6 +54,11 @@ IDX_GASOIL_AZUL_FOTO_NIVEL = 11
 IDX_GASOIL_AZUL_FOTO_RECARGA = 12
 GASOIL_AZUL_MIN_LINEAS = 4
 
+# Aceite planta azul, justo después del gasoil (la foto de recarga se salta
+# si hay 4 líneas o más, y esta pregunta queda como la siguiente).
+IDX_ACEITE_AZUL = IDX_GASOIL_AZUL_FOTO_RECARGA + 1
+IDX_ACEITE_AZUL_FOTO = IDX_ACEITE_AZUL + 1
+
 # Meta CMI: segundos por vasito según cuántas personas envasaron
 # 4 personas → 14 s; 3 → 18 s; 2 → 26 s. 5 o más usa la de 4.
 METAS_SEGUNDOS_POR_VASITO = {
@@ -184,6 +189,25 @@ PREGUNTAS = [
 - Sin adjunto es inválido, aunque haya texto.
 - Foto sola (sin texto) ES válida.
 - Esta pregunta solo se hace si las líneas de gasoil eran menos de 4.
+""",
+    },
+    {
+        "texto": "11. ¿Cuál es el nivel de aceite de la planta azul?",
+        "reglas": """
+- Válido: algo del aceite (bien / óptimo / bajo / foto).
+- "aceite bien" ES válido.
+- "óptimo", "bajo" y "bien" ES válido.
+- Si la planta está en uso y no puede medir, acepta esa explicación + lo que sísepa.
+- Foto + texto corto sobre niveles ES válido.
+- No pidas gasoil: esta pregunta es solo el nivel de aceite de la planta azul.
+""",
+    },
+    {
+        "texto": "Envía una foto del nivel de aceite de la planta azul.",
+        "reglas": """
+- Válido SOLO si hay una foto adjunta del nivel de aceite.
+- Sin adjunto es inválido, aunque haya texto.
+- Foto sola (sin texto) ES válida.
 """,
     },
     {
@@ -927,6 +951,7 @@ async def manejar_respuesta(message: discord.Message):
         IDX_GASOIL_AZUL_LINEAS,
         IDX_GASOIL_AZUL_FOTO_NIVEL,
         IDX_GASOIL_AZUL_FOTO_RECARGA,
+        IDX_ACEITE_AZUL_FOTO,
     ):
         await _manejar_gasoil_planta_azul(message, state, texto, tiene_adjuntos)
         return
