@@ -5,6 +5,7 @@ import traceback
 from openai import OpenAI
 import json
 import re
+import unicodedata
 from math import isfinite
 from typing import Optional
 
@@ -35,6 +36,8 @@ client = OpenAI(
 #     "buffer": "",          # respuestas parciales de la pregunta actual
 #     "sin_pedidos": bool,   # True si hoy no se alistaron pedidos
 #     "gasoil_azul_lineas": int,  # líneas ya respondidas de la planta azul
+#     "planta_azul_prendida": bool,  # True si dijeron que está prendida
+#     "planta_azul_switch_confirmar": bool,  # esperando el sí de que lo apagaron
 #   }
 # }
 conversation_state = {}
@@ -47,17 +50,29 @@ PEDIDOS_FIN = 4  # preguntas 1..5 inclusive
 IDX_VASITOS_HORAS = 6
 IDX_VASITOS_CANTIDAD = 7
 
-# Gasoil planta azul (0-based): líneas, foto del nivel y, si hay menos de 4,
-# foto después de recargar. No desplaza los índices de pedidos ni de vasitos.
-IDX_GASOIL_AZUL_LINEAS = 10
-IDX_GASOIL_AZUL_FOTO_NIVEL = 11
-IDX_GASOIL_AZUL_FOTO_RECARGA = 12
+# Planta azul (0-based). No desplaza los índices de pedidos ni de vasitos.
+# Prendida → líneas de antes de prenderla, y se saltan fotos, aceite y switch.
+# Apagada → líneas, foto del nivel, foto de recarga si < 4, aceite, foto de
+# aceite y, al final, el switch de la llave. La planta roja va justo después.
+IDX_PLANTA_AZUL_PRENDIDA = 10
+IDX_GASOIL_AZUL_LINEAS = 11
+IDX_GASOIL_AZUL_FOTO_NIVEL = 12
+IDX_GASOIL_AZUL_FOTO_RECARGA = 13
 GASOIL_AZUL_MIN_LINEAS = 4
 
 # Aceite planta azul, justo después del gasoil (la foto de recarga se salta
 # si hay 4 líneas o más, y esta pregunta queda como la siguiente).
 IDX_ACEITE_AZUL = IDX_GASOIL_AZUL_FOTO_RECARGA + 1
 IDX_ACEITE_AZUL_FOTO = IDX_ACEITE_AZUL + 1
+IDX_PLANTA_AZUL_SWITCH = IDX_ACEITE_AZUL_FOTO + 1
+
+TEXTO_PLANTA_AZUL_PRENDIDA = "¿La planta azul está prendida?"
+TEXTO_GASOIL_AZUL_LINEAS = "¿Cuántas líneas de gasoil tiene la planta azul?"
+TEXTO_GASOIL_AZUL_LINEAS_ANTES = (
+    "¿Cuántas líneas de gasoil tenía la planta azul antes de prenderla?"
+)
+TEXTO_PLANTA_AZUL_SWITCH = "¿Quedó el switch de la llave en apagado?"
+TEXTO_APAGAR_SWITCH = "Apaga el switch de la llave de la planta azul."
 
 # Meta CMI: segundos por vasito según cuántas personas envasaron
 # 4 personas → 14 s; 3 → 18 s; 2 → 26 s. 5 o más usa la de 4.
@@ -167,11 +182,21 @@ PREGUNTAS = [
 """,
     },
     {
-        "texto": "¿Cuántas líneas de gasoil tiene la planta azul?",
+        "texto": TEXTO_PLANTA_AZUL_PRENDIDA,
+        "reglas": """
+- Esta pregunta la resuelve el bot en código (sí/no), no Grok.
+- Prendida: sí, si, s, yes, prendida, encendida, "está prendida".
+- Apagada: no, n, apagada, "está apagada".
+- Si no se entiende, se vuelve a preguntar.
+""",
+    },
+    {
+        "texto": TEXTO_GASOIL_AZUL_LINEAS,
         "reglas": """
 - Válido SOLO si la respuesta es un número entero ≥ 0 (0, 1, 2, 3, 4, …).
 - Inválido: texto, decimales, negativos, "medio tanque", "5 rayas", "cinco", "4 líneas".
 - No pidas nivel de aceite: esta pregunta es solo el número de líneas.
+- Si la planta estaba prendida, el bot pregunta en su lugar cuántas líneas tenía antes de prenderla. La validación es la misma.
 """,
     },
     {
@@ -208,6 +233,15 @@ PREGUNTAS = [
 - Válido SOLO si hay una foto adjunta del nivel de aceite.
 - Sin adjunto es inválido, aunque haya texto.
 - Foto sola (sin texto) ES válida.
+""",
+    },
+    {
+        "texto": TEXTO_PLANTA_AZUL_SWITCH,
+        "reglas": """
+- Esta pregunta la resuelve el bot en código (sí/no), no Grok.
+- Sí: el switch quedó apagado.
+- No: hay que apagarlo y confirmar con sí.
+- Si no se entiende, se vuelve a preguntar.
 """,
     },
     {
@@ -327,6 +361,153 @@ def _entero_no_negativo(texto: str) -> Optional[int]:
     return int(t)
 
 
+# Sí/no de la planta azul. Las palabras de estado cambian de sentido según
+# la pregunta: "apagada" niega "¿está prendida?" y afirma "¿quedó apagado?".
+_SI_EXACTOS = {"si", "s", "yes", "sip", "sep", "afirmativo"}
+_NO_EXACTOS = {"no", "n", "nop", "nope", "negativo"}
+_RELLENO_SI_NO = r"(?:ok|vale|bueno|pues|claro|ya|gracias)"
+_PALABRAS_PRENDIDA = (
+    "prendida",
+    "prendido",
+    "encendida",
+    "encendido",
+    "prendio",
+    "encendio",
+)
+_PALABRAS_APAGADA = ("apagada", "apagado", "apago", "apague", "apagaron")
+
+
+def _normalizar_texto_respuesta(texto: str) -> str:
+    """Minúsculas, sin acentos. Punto, salto y punto y coma separan cláusulas."""
+    t = (texto or "").strip().lower()
+    if not t:
+        return ""
+    t = unicodedata.normalize("NFD", t)
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+    t = t.replace("¿", " ").replace("¡", " ")
+    t = re.sub(r"[!?]+", " ", t)
+    t = re.sub(r"[\n\r.;]+", ",", t)
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"\s*,\s*", ", ", t)
+    t = re.sub(r"(?:,\s*)+", ", ", t)
+    return t.strip(" ,")
+
+
+def _es_duda(texto: str) -> bool:
+    if re.search(
+        r"\b(ni idea|quizas|tal vez|mas o menos|puede ser|no estoy segur[oa]|depende|nose)\b",
+        texto,
+    ):
+        return True
+    if re.fullmatch(r"no se( si)?", texto) or re.fullmatch(r"no lo se( si)?", texto):
+        return True
+    if re.search(r"\bno se si\b", texto) or re.search(r"\bno lo se\b", texto):
+        return True
+    return False
+
+
+def _si_no_puro(texto: str) -> Optional[bool]:
+    """Sí/no solo, o con relleno corto ('claro si', 'no ya'). None si hay más."""
+    if texto in _SI_EXACTOS:
+        return True
+    if texto in _NO_EXACTOS:
+        return False
+    si = r"(?:si|s|yes|sip|sep|afirmativo)"
+    no = r"(?:no|n|nop|nope|negativo)"
+    relleno = _RELLENO_SI_NO
+    if re.fullmatch(rf"{relleno}(?:\s+{relleno})*(?:\s+que)?\s+{si}", texto):
+        return True
+    if re.fullmatch(rf"{relleno}(?:\s+{relleno})*(?:\s+que)?\s+{no}", texto):
+        return False
+    if re.fullmatch(rf"{si}(?:\s+{relleno})+", texto):
+        return True
+    if re.fullmatch(rf"{no}(?:\s+{relleno})+", texto):
+        return False
+    return None
+
+
+def _tiene_palabra(texto: str, palabras: tuple) -> bool:
+    return any(re.search(rf"\b{re.escape(p)}\b", texto) for p in palabras)
+
+
+def _palabra_negada(texto: str, palabra: str) -> bool:
+    """'no está prendida' / 'no se apagó', no un 'no' suelto de otra cláusula."""
+    return (
+        re.search(
+            rf"\bno\b(?:\s+\w+){{0,6}}\s+{re.escape(palabra)}\b",
+            texto,
+        )
+        is not None
+    )
+
+
+def _clasificar_clausula(texto: str, afirmacion: tuple, negacion: tuple) -> Optional[bool]:
+    t = texto.strip()
+    if not t or _es_duda(t):
+        return None
+    tiene_af = _tiene_palabra(t, afirmacion)
+    tiene_ng = _tiene_palabra(t, negacion)
+    puro = _si_no_puro(t)
+    if not tiene_af and not tiene_ng:
+        return puro
+    if tiene_af and tiene_ng:
+        return None
+    if re.search(r"\bsi\b", t) and re.search(r"\bno\b", t):
+        return None
+    palabras = afirmacion if tiene_af else negacion
+    presentes = [p for p in palabras if re.search(rf"\b{re.escape(p)}\b", t)]
+    negada = any(_palabra_negada(t, p) for p in presentes)
+    base = True if tiene_af else False
+    return (not base) if negada else base
+
+
+def _clasificar_si_no(texto: str, afirmacion: tuple, negacion: tuple) -> Optional[bool]:
+    """True/False si se entiende; None para volver a preguntar."""
+    t = _normalizar_texto_respuesta(texto)
+    if not t or _es_duda(t):
+        return None
+    partes = [p.strip() for p in t.split(",") if p.strip()]
+    if len(partes) <= 1:
+        return _clasificar_clausula(t, afirmacion, negacion)
+
+    estados = []
+    puros = []
+    for parte in partes:
+        if _es_duda(parte):
+            continue
+        valor = _clasificar_clausula(parte, afirmacion, negacion)
+        if valor is None:
+            continue
+        if _tiene_palabra(parte, afirmacion) or _tiene_palabra(parte, negacion):
+            estados.append(valor)
+        else:
+            puros.append(valor)
+    if estados:
+        if not all(v == estados[0] for v in estados):
+            return None
+        if puros and not all(v == estados[0] for v in puros):
+            return None
+        return estados[0]
+    if puros and all(v == puros[0] for v in puros):
+        return puros[0]
+    return None
+
+
+def _planta_azul_esta_prendida(texto: str) -> Optional[bool]:
+    return _clasificar_si_no(texto, _PALABRAS_PRENDIDA, _PALABRAS_APAGADA)
+
+
+def _switch_quedo_apagado(texto: str) -> Optional[bool]:
+    """True si el switch quedó apagado. 'apagado' aquí es un sí."""
+    return _clasificar_si_no(texto, _PALABRAS_APAGADA, _PALABRAS_PRENDIDA)
+
+
+def _texto_lineas_gasoil_azul(state: dict) -> str:
+    if state.get("planta_azul_prendida"):
+        return TEXTO_GASOIL_AZUL_LINEAS_ANTES
+    return TEXTO_GASOIL_AZUL_LINEAS
+
+
 def _respuesta_con_adjuntos(texto: str, nombres_adjuntos) -> str:
     """Mismo formato que ya se arma para la validación: texto + [Adjuntos: …]."""
     cuerpo = (texto or "").strip()
@@ -362,6 +543,10 @@ async def _preguntar_o_cerrar(message: discord.Message, state: dict) -> None:
     del conversation_state[channel_id]
 
 
+def _mensaje_confirmar_switch() -> str:
+    return f"{TEXTO_APAGAR_SWITCH}\nCuando lo hayas apagado, responde sí."
+
+
 async def _manejar_gasoil_planta_azul(
     message: discord.Message,
     state: dict,
@@ -369,6 +554,26 @@ async def _manejar_gasoil_planta_azul(
     tiene_adjuntos: bool,
 ) -> None:
     paso = state["paso"]
+
+    if paso == IDX_PLANTA_AZUL_PRENDIDA:
+        prendida = _planta_azul_esta_prendida(texto)
+        if prendida is None:
+            await message.channel.send(
+                "No entendí. Responde si está prendida o apagada "
+                "(por ejemplo: sí, prendida, no, apagada).\n\n"
+                f"{PREGUNTAS[IDX_PLANTA_AZUL_PRENDIDA]['texto']}"
+            )
+            return
+        try:
+            await message.add_reaction("✅")
+        except Exception:
+            pass
+        state["answers"][str(paso)] = texto
+        state["planta_azul_prendida"] = prendida
+        state["buffer"] = ""
+        state["paso"] = IDX_GASOIL_AZUL_LINEAS
+        await message.channel.send(_texto_lineas_gasoil_azul(state))
+        return
 
     if paso == IDX_GASOIL_AZUL_LINEAS:
         n = _entero_no_negativo(texto)
@@ -380,7 +585,7 @@ async def _manejar_gasoil_planta_azul(
                     state["buffer"] = texto
             await message.channel.send(
                 "Tiene que ser un número entero, 0 o más.\n\n"
-                f"{PREGUNTAS[IDX_GASOIL_AZUL_LINEAS]['texto']}"
+                f"{_texto_lineas_gasoil_azul(state)}"
             )
             return
         try:
@@ -390,8 +595,53 @@ async def _manejar_gasoil_planta_azul(
         state["answers"][str(paso)] = str(n)
         state["gasoil_azul_lineas"] = n
         state["buffer"] = ""
+        if state.get("planta_azul_prendida"):
+            # Mismo criterio que la foto de recarga: el paso que no se hace
+            # no se guarda en answers.
+            state["paso"] = IDX_PLANTA_AZUL_SWITCH + 1
+            await _preguntar_o_cerrar(message, state)
+            return
         state["paso"] = IDX_GASOIL_AZUL_FOTO_NIVEL
         await message.channel.send(PREGUNTAS[IDX_GASOIL_AZUL_FOTO_NIVEL]["texto"])
+        return
+
+    if paso == IDX_PLANTA_AZUL_SWITCH:
+        if state.get("planta_azul_switch_confirmar"):
+            if _switch_quedo_apagado(texto) is not True:
+                await message.channel.send(_mensaje_confirmar_switch())
+                return
+            previo = (state.get("buffer") or "").strip()
+            state["answers"][str(paso)] = f"{previo}\n{texto}".strip() if previo else texto
+            state["buffer"] = ""
+            state["planta_azul_switch_confirmar"] = False
+            try:
+                await message.add_reaction("✅")
+            except Exception:
+                pass
+            state["paso"] = paso + 1
+            await _preguntar_o_cerrar(message, state)
+            return
+
+        quedo_apagado = _switch_quedo_apagado(texto)
+        if quedo_apagado is None:
+            await message.channel.send(
+                "No entendí. Responde sí o no.\n\n"
+                f"{PREGUNTAS[IDX_PLANTA_AZUL_SWITCH]['texto']}"
+            )
+            return
+        if not quedo_apagado:
+            state["buffer"] = texto
+            state["planta_azul_switch_confirmar"] = True
+            await message.channel.send(_mensaje_confirmar_switch())
+            return
+        try:
+            await message.add_reaction("✅")
+        except Exception:
+            pass
+        state["answers"][str(paso)] = texto
+        state["buffer"] = ""
+        state["paso"] = paso + 1
+        await _preguntar_o_cerrar(message, state)
         return
 
     if not tiene_adjuntos:
@@ -852,7 +1102,8 @@ Responde ÚNICAMENTE con JSON válido:
 
 # Errores que DEBES evitar (casos reales)
 - Rechazar "3.217 pote" por "no dijiste la cantidad" cuando el número está.
-- Rechazar "medio tanque y aceite bien" pidiendo gasoil otra vez.
+- En el aceite de la planta azul no rechaces "aceite bien", "óptimo" o "bajo" pidiendo gasoil o "medio tanque": el gasoil de la azul se contesta aparte, con un número de líneas.
+- En la planta roja no rechaces "medio tanque y aceite bien" pidiendo el gasoil otra vez.
 - Rechazar "10 de 25L y 4 de 30L" pidiendo "cantidad total".
 - Rechazar "Yuselis empezó 5:45 hasta 6:45" pidiendo horas o nombres otra vez.
 - Exigir nombres de quien alistó cuando dijeron "hoy no se hicieron pedidos".
@@ -948,10 +1199,12 @@ async def manejar_respuesta(message: discord.Message):
     tiene_adjuntos = bool(message.attachments)
 
     if paso in (
+        IDX_PLANTA_AZUL_PRENDIDA,
         IDX_GASOIL_AZUL_LINEAS,
         IDX_GASOIL_AZUL_FOTO_NIVEL,
         IDX_GASOIL_AZUL_FOTO_RECARGA,
         IDX_ACEITE_AZUL_FOTO,
+        IDX_PLANTA_AZUL_SWITCH,
     ):
         await _manejar_gasoil_planta_azul(message, state, texto, tiene_adjuntos)
         return
