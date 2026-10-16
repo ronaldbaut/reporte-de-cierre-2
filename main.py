@@ -35,7 +35,7 @@ client = OpenAI(
 #     "answers": { "0": "...", ... },
 #     "buffer": "",          # respuestas parciales de la pregunta actual
 #     "sin_pedidos": bool,   # True si hoy no se alistaron pedidos
-#     "gasoil_azul_lineas": int,  # líneas ya respondidas de la planta azul
+#     "gasoil_azul_lineas": float,  # líneas ya respondidas de la planta azul
 #     "planta_azul_prendida": bool,  # True si dijeron que está prendida
 #     "planta_azul_switch_confirmar": bool,  # esperando el sí de que lo apagaron
 #   }
@@ -353,12 +353,28 @@ def _saltar_resto_pedidos(state: dict) -> None:
         state["buffer"] = ""
 
 
-def _entero_no_negativo(texto: str) -> Optional[int]:
-    """Entero ≥ 0, o None si el mensaje no es solo ese número."""
-    t = (texto or "").strip()
-    if not re.fullmatch(r"\d+", t):
+def _lineas_gasoil(texto: str) -> Optional[float]:
+    """Líneas de gasoil ≥ 0, o None si el mensaje no es solo ese número.
+
+    Acepta entero o decimal con coma o punto ("4", "4,5", "4.5") y, al final,
+    la palabra línea o líneas (mayúsculas y acentos no importan).
+    """
+    t = (texto or "").strip().lower()
+    if not t:
         return None
-    return int(t)
+    t = unicodedata.normalize("NFD", t)
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+    t = re.sub(r"\s+", " ", t).strip()
+    m = re.fullmatch(r"(\d+(?:[.,]\d+)?)(?: lineas?)?", t)
+    if not m:
+        return None
+    try:
+        valor = float(m.group(1).replace(",", "."))
+    except ValueError:
+        return None
+    if not isfinite(valor) or valor < 0:
+        return None
+    return valor
 
 
 # Sí/no de la planta azul. Las palabras de estado cambian de sentido según
@@ -519,7 +535,7 @@ def _respuesta_con_adjuntos(texto: str, nombres_adjuntos) -> str:
     return nota
 
 
-def _siguiente_tras_foto_nivel_gasoil(lineas: int):
+def _siguiente_tras_foto_nivel_gasoil(lineas: float):
     """Si hay menos de 4 líneas, toca la foto post-recarga. Si no, la pregunta siguiente."""
     if lineas < GASOIL_AZUL_MIN_LINEAS:
         return IDX_GASOIL_AZUL_FOTO_RECARGA, True
@@ -576,7 +592,7 @@ async def _manejar_gasoil_planta_azul(
         return
 
     if paso == IDX_GASOIL_AZUL_LINEAS:
-        n = _entero_no_negativo(texto)
+        n = _lineas_gasoil(texto)
         if n is None:
             if texto and not _vacio_o_basura(texto, False):
                 if state["buffer"]:
@@ -592,7 +608,7 @@ async def _manejar_gasoil_planta_azul(
             await message.add_reaction("✅")
         except Exception:
             pass
-        state["answers"][str(paso)] = str(n)
+        state["answers"][str(paso)] = str(int(n)) if n.is_integer() else str(n)
         state["gasoil_azul_lineas"] = n
         state["buffer"] = ""
         if state.get("planta_azul_prendida"):
@@ -672,7 +688,7 @@ async def _manejar_gasoil_planta_azul(
     if paso == IDX_GASOIL_AZUL_FOTO_NIVEL:
         lineas = state.get("gasoil_azul_lineas")
         if lineas is None:
-            lineas = _entero_no_negativo(
+            lineas = _lineas_gasoil(
                 state["answers"].get(str(IDX_GASOIL_AZUL_LINEAS), "")
             )
         if lineas is None:
