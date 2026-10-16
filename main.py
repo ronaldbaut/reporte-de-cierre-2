@@ -600,7 +600,7 @@ async def _manejar_gasoil_planta_azul(
                 else:
                     state["buffer"] = texto
             await message.channel.send(
-                "Tiene que ser un número entero, 0 o más.\n\n"
+                "Tiene que ser un número, 0 o más (ej. 4 o 4,5).\n\n"
                 f"{_texto_lineas_gasoil_azul(state)}"
             )
             return
