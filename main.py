@@ -309,6 +309,34 @@ PREGUNTAS = [
 - "4 de 30 y 5 de 25" ES válido.
 """,
     },
+    {
+        "texto": "20. ¿Recibiste todos los implementos de ventas de San Cristóbal?",
+        "reglas": """
+- "Sí" / "Si" / "No" ES válido (la pregunta es de sí/no).
+- "No" también es válido: el detalle de qué faltó o sobró va en la pregunta siguiente.
+- NO obligues a copiar la pregunta.
+""",
+    },
+    {
+        "texto": "21. ¿Qué faltó o sobró de: bolsas de papel, bolsas de plástico, bolsos grandes, bolsos pequeños y pilas?",
+        "reglas": """
+- Válido: respuestas con "faltó" seguido de lo que faltó y/o "sobró" seguido de lo que sobró, de todos los artículos o solo de algunos.
+- Ejemplos válidos: "faltó 2 pilas", "sobró 10 bolsas de papel", "faltó 1 bolso grande, sobró 5 bolsas de plástico".
+- Los artículos no mencionados se entienden completos: NO exijas listar todos los artículos.
+- "nada, llegó todo completo" / "no faltó ni sobró nada" sigue siendo válido.
+- También válido: "no faltó nada" y/o "no sobró nada", solos o combinados con la otra parte (ej. "no faltó nada, sobró 3 pilas").
+- Inválido: vacío, ".", "ok", o solo "sí"/"si" sin información.
+- NO obligues a copiar la pregunta.
+""",
+    },
+    {
+        "texto": "22. ¿Enviaste el mensaje de lo que llegó?",
+        "reglas": """
+- "Sí" / "Si" / "No" ES válido (la pregunta es de sí/no).
+- "No" también es válido.
+- NO obligues a copiar la pregunta.
+""",
+    },
 ]
 
 
