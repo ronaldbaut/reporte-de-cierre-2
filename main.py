@@ -54,14 +54,24 @@ IDX_VASITOS_CANTIDAD = 7
 IDX_VASITOS_PERSONAS = 8
 IDX_VASITOS_PAUSAS = 9
 
-# Planta azul (0-based), después de limpieza y de los tambores.
+# Foto obligatoria de las cuatro batidoras, justo después de confirmar
+# que se limpiaron los tambores (pregunta 10). El texto solo no alcanza.
+# Vale una foto de las cuatro, o varias en el mismo mensaje. No mueve los
+# índices de pedidos ni de vasitos.
+IDX_BATIDORAS_FOTO = 12
+TEXTO_BATIDORAS_FOTO = (
+    "Envía una foto de las cuatro batidoras limpias. "
+    "Si son varias, envíalas todas en el mismo mensaje."
+)
+
+# Planta azul (0-based), después de la foto de las batidoras.
 # Prendida → líneas de antes de prenderla, y se saltan fotos, aceite y switch.
 # Apagada → líneas, foto del nivel, foto de recarga si < 4, aceite, foto de
 # aceite y, al final, el switch de la llave. La planta roja va justo después.
-IDX_PLANTA_AZUL_PRENDIDA = 12
-IDX_GASOIL_AZUL_LINEAS = 13
-IDX_GASOIL_AZUL_FOTO_NIVEL = 14
-IDX_GASOIL_AZUL_FOTO_RECARGA = 15
+IDX_PLANTA_AZUL_PRENDIDA = 13
+IDX_GASOIL_AZUL_LINEAS = 14
+IDX_GASOIL_AZUL_FOTO_NIVEL = 15
+IDX_GASOIL_AZUL_FOTO_RECARGA = 16
 GASOIL_AZUL_MIN_LINEAS = 4
 
 # Aceite planta azul, justo después del gasoil (la foto de recarga se salta
@@ -226,6 +236,16 @@ PREGUNTAS = [
 - Válido: confirma ambas cosas, o un "sí" claro a la pregunta completa.
 - "Si están limpios y sin sal" ES válido.
 - Si solo confirma una parte, pide solo la que falta.
+""",
+    },
+    {
+        "texto": TEXTO_BATIDORAS_FOTO,
+        "reglas": """
+- Esta pregunta la resuelve el bot en código, no Grok.
+- Válido SOLO si hay una foto adjunta de las batidoras limpias.
+- Una foto de las cuatro, o varias fotos en el mismo mensaje, son válidas.
+- Sin adjunto es inválido, aunque haya texto (un "sí" no alcanza).
+- Foto sola (sin texto) ES válida.
 """,
     },
     {
@@ -638,6 +658,59 @@ def _mensaje_confirmar_switch() -> str:
     return f"{TEXTO_APAGAR_SWITCH}\nCuando lo hayas apagado, responde sí."
 
 
+async def _guardar_foto_obligatoria(
+    message: discord.Message,
+    state: dict,
+    texto: str,
+    tiene_adjuntos: bool,
+) -> bool:
+    """True si había foto y quedó guardada. Si no, pide la foto y no avanza.
+
+    Igual para las batidoras y para las fotos de la planta azul: vale una
+    imagen o varias en el mismo mensaje. El texto solo no alcanza. Los
+    nombres quedan en la respuesta como [Adjuntos: …], que es lo que se
+    imprime al cerrar el reporte.
+    """
+    paso = state["paso"]
+    if not tiene_adjuntos:
+        if texto and not _vacio_o_basura(texto, False):
+            if state["buffer"]:
+                state["buffer"] = (state["buffer"] + "\n" + texto).strip()
+            else:
+                state["buffer"] = texto
+        await message.channel.send(
+            "Falta la foto. Adjunta la imagen en el mensaje.\n\n"
+            f"{PREGUNTAS[paso]['texto']}"
+        )
+        return False
+
+    try:
+        await message.add_reaction("✅")
+    except Exception:
+        pass
+
+    if state["buffer"]:
+        buffer_completo = (state["buffer"] + "\n" + texto).strip()
+    else:
+        buffer_completo = texto
+    nombres = [a.filename for a in message.attachments]
+    state["answers"][str(paso)] = _respuesta_con_adjuntos(buffer_completo, nombres)
+    state["buffer"] = ""
+    return True
+
+
+async def _manejar_foto_batidoras(
+    message: discord.Message,
+    state: dict,
+    texto: str,
+    tiene_adjuntos: bool,
+) -> None:
+    if not await _guardar_foto_obligatoria(message, state, texto, tiene_adjuntos):
+        return
+    state["paso"] += 1
+    await _preguntar_o_cerrar(message, state)
+
+
 async def _manejar_gasoil_planta_azul(
     message: discord.Message,
     state: dict,
@@ -735,30 +808,8 @@ async def _manejar_gasoil_planta_azul(
         await _preguntar_o_cerrar(message, state)
         return
 
-    if not tiene_adjuntos:
-        if texto and not _vacio_o_basura(texto, False):
-            if state["buffer"]:
-                state["buffer"] = (state["buffer"] + "\n" + texto).strip()
-            else:
-                state["buffer"] = texto
-        await message.channel.send(
-            "Falta la foto. Adjunta la imagen en el mensaje.\n\n"
-            f"{PREGUNTAS[paso]['texto']}"
-        )
+    if not await _guardar_foto_obligatoria(message, state, texto, tiene_adjuntos):
         return
-
-    try:
-        await message.add_reaction("✅")
-    except Exception:
-        pass
-
-    if state["buffer"]:
-        buffer_completo = (state["buffer"] + "\n" + texto).strip()
-    else:
-        buffer_completo = texto
-    nombres = [a.filename for a in message.attachments]
-    state["answers"][str(paso)] = _respuesta_con_adjuntos(buffer_completo, nombres)
-    state["buffer"] = ""
 
     if paso == IDX_GASOIL_AZUL_FOTO_NIVEL:
         lineas = state.get("gasoil_azul_lineas")
@@ -1670,6 +1721,10 @@ async def manejar_respuesta(message: discord.Message):
     pregunta_item = PREGUNTAS[paso]
     texto = (message.content or "").strip()
     tiene_adjuntos = bool(message.attachments)
+
+    if paso == IDX_BATIDORAS_FOTO:
+        await _manejar_foto_batidoras(message, state, texto, tiene_adjuntos)
+        return
 
     if paso in (
         IDX_PLANTA_AZUL_PRENDIDA,
