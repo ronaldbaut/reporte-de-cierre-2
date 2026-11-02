@@ -1,3 +1,4 @@
+import asyncio
 import discord
 from discord.ext import commands
 import os
@@ -46,18 +47,21 @@ conversation_state = {}
 PEDIDOS_INICIO = 0
 PEDIDOS_FIN = 4  # preguntas 1..5 inclusive
 
-# Preguntas de envasado de vasitos (0-based): 7 = horas+personas, 8 = cantidad
+# Envasado de vasitos (0-based):
+# 6 = horario, 7 = cantidad, 8 = número de personas, 9 = minutos de pausa.
 IDX_VASITOS_HORAS = 6
 IDX_VASITOS_CANTIDAD = 7
+IDX_VASITOS_PERSONAS = 8
+IDX_VASITOS_PAUSAS = 9
 
-# Planta azul (0-based). No desplaza los índices de pedidos ni de vasitos.
+# Planta azul (0-based), después de limpieza y de los tambores.
 # Prendida → líneas de antes de prenderla, y se saltan fotos, aceite y switch.
 # Apagada → líneas, foto del nivel, foto de recarga si < 4, aceite, foto de
 # aceite y, al final, el switch de la llave. La planta roja va justo después.
-IDX_PLANTA_AZUL_PRENDIDA = 10
-IDX_GASOIL_AZUL_LINEAS = 11
-IDX_GASOIL_AZUL_FOTO_NIVEL = 12
-IDX_GASOIL_AZUL_FOTO_RECARGA = 13
+IDX_PLANTA_AZUL_PRENDIDA = 12
+IDX_GASOIL_AZUL_LINEAS = 13
+IDX_GASOIL_AZUL_FOTO_NIVEL = 14
+IDX_GASOIL_AZUL_FOTO_RECARGA = 15
 GASOIL_AZUL_MIN_LINEAS = 4
 
 # Aceite planta azul, justo después del gasoil (la foto de recarga se salta
@@ -81,6 +85,25 @@ METAS_SEGUNDOS_POR_VASITO = {
     3: 18,
     4: 14,
 }
+
+# El bot solo menciona con <@id> a quien está respondiendo el cierre.
+# Tania no tiene id acá, así que el aviso la nombra en texto.
+MENSAJE_FALLO_META_ENVASADO = (
+    "⚠️ **No pude calcular la meta de envasado de vasitos.** "
+    "Tania, por favor revise este cierre."
+)
+MENSAJE_SIN_VASITOS = (
+    "📊 **Envasado de vasitos:** No se envasaron vasitos hoy: no hay promedio que calcular."
+)
+NOTA_PAUSA_TANIA = (
+    "• Nota: el descuento de estos minutos de pausa queda sujeto a la aprobación de Tania. "
+    "Si no lo aprueba en sus observaciones, los extras semanales se recalculan "
+    "con el tiempo bruto, sin ese descuento."
+)
+
+# Un intento extra si Grok falla, viene vacío o el JSON no trae horas usables.
+ENVASADO_EXTRACCION_TIMEOUT = 30
+ENVASADO_REINTENTO_ESPERA = 1
 
 # ================== PREGUNTAS + REGLAS POR PREGUNTA ==================
 # Cada item: texto que ve el trabajador + reglas que ve Grok.
@@ -162,6 +185,30 @@ PREGUNTAS = [
 - NO exijas "total" si ya dio números claros de vasitos.
 - Inválido: solo horas de envasado sin cantidad.
 - "0" / "ninguno" / "no se envasaron vasitos" ES válido.
+""",
+    },
+    {
+        "texto": (
+            "¿Cuántas personas envasaron los vasitos? "
+            "Escribe el número. Si quieres, agrega los nombres después "
+            "(ejemplo: 2, José Luis y Ángel)."
+        ),
+        "reglas": """
+- Esta pregunta la resuelve el bot en código, no Grok.
+- Válido solo con un número entero de personas (1 a 20).
+- Nombres solos, sin número, no alcanzan: hay que volver a pedir el número.
+- Ejemplo válido: "2, José Luis y Ángel".
+""",
+    },
+    {
+        "texto": (
+            "¿Cuántos minutos pausaron durante el envasado de vasitos? "
+            "Si no pausaron, escribe 0."
+        ),
+        "reglas": """
+- Esta pregunta la resuelve el bot en código, no Grok.
+- Válido: minutos con un número, de 0 a 480. 0 si no hubo pausa.
+- "no", "ninguna" y "sin pausa" cuentan como 0.
 """,
     },
     {
@@ -803,14 +850,265 @@ def _meta_para_personas(n: int) -> Optional[int]:
     return METAS_SEGUNDOS_POR_VASITO.get(n)
 
 
-def calcular_envasado_vasitos(datos: dict) -> Optional[dict]:
-    """
-    datos extraídos por Grok:
-      hubo_envasado, vasitos, n_trabajadores, trabajadores, tramos[{inicio,fin,pausa_minutos}]
-    El promedio es tiempo de reloj / vasitos (no minutos-persona).
-    """
-    if not datos or not datos.get("hubo_envasado", True):
+def _vasitos_entero_simple(texto: str) -> Optional[int]:
+    """Cantidad si la respuesta es solo un entero ('673', '742 vasitos')."""
+    t = _normalizar_texto_respuesta(texto)
+    m = re.fullmatch(r"(\d+)\s*(vasitos?|unidades?)?", t)
+    if not m:
         return None
+    return int(m.group(1))
+
+
+def _respuesta_sin_vasitos(texto: str) -> bool:
+    """True si dijeron que hoy no se envasaron vasitos."""
+    t = _normalizar_texto_respuesta(texto)
+    if not t:
+        return False
+    if t in {
+        "0",
+        "cero",
+        "nada",
+        "ninguno",
+        "ningunos",
+        "ninguna",
+        "no",
+        "no hubo",
+        "no se envasaron",
+        "no se envaso",
+        "no envasamos",
+        "no hubo vasitos",
+        "sin vasitos",
+        "0 vasitos",
+        "cero vasitos",
+        "ningun vasito",
+        "ninguno vasito",
+    }:
+        return True
+    if re.fullmatch(r"0+\s*(vasitos?|unidades?)?", t):
+        return True
+    if re.fullmatch(r"(cero|ninguno|ningunos|nada)\s*(vasitos?)?", t):
+        return True
+    if re.search(r"\b(no|sin|ningun|ninguno)\b", t) and re.search(
+        r"\b(vasitos?|envasado|envasaron|envaso|envasar)\b", t
+    ):
+        if re.search(r"[1-9]", t):
+            return False
+        return True
+    nums = re.findall(r"\d+", t)
+    if nums and all(int(n) == 0 for n in nums) and not re.search(r"[1-9]", t):
+        return True
+    return False
+
+
+def _numero_personas(texto: str) -> Optional[int]:
+    """Entero explícito de personas. None si hay que adivinar por los nombres.
+
+    «José Luis y ángel» no trae número: puede ser 2 o 3, y no se cuenta.
+    «2, José Luis y Ángel» sí: el 2 es la cantidad que vale para la meta.
+    """
+    t = _normalizar_texto_respuesta(texto)
+    if not t:
+        return None
+    nums = re.findall(r"\d+", t)
+    if len(set(nums)) != 1:
+        return None
+    n = int(nums[0])
+    if not 1 <= n <= 20:
+        return None
+    return n
+
+
+_RE_RELLENO_PERSONAS = re.compile(
+    r"\b(personas?|trabajadores?|trabajador|fueron|fuimos|somos|son|éramos|eramos|nombres?)\b",
+    re.IGNORECASE,
+)
+
+
+def _detalle_personas(texto: str) -> str:
+    """Nombres que acompañan al número, para mostrarlos. No se usan para contar."""
+    t = _RE_RELLENO_PERSONAS.sub(" ", texto or "")
+    t = re.sub(r"\d+", " ", t)
+    t = t.replace("\n", " ")
+    t = re.sub(r"\s+", " ", t)
+    return t.strip(" ,.;:-–—")
+
+
+_PAUSA_CERO_EXACTA = {
+    "0",
+    "cero",
+    "nada",
+    "ninguna",
+    "ninguno",
+    "no",
+    "nop",
+    "sin pausa",
+    "sin pausas",
+    "no pausamos",
+    "no paramos",
+    "no hubo",
+    "no hubo pausa",
+    "no hubo pausas",
+}
+
+
+def _minutos_pausa(texto: str) -> Optional[int]:
+    """Minutos de pausa, 0 a 480. None si no hay un número claro."""
+    t = _normalizar_texto_respuesta(texto)
+    if not t:
+        return None
+    if t in _PAUSA_CERO_EXACTA:
+        return 0
+    if re.fullmatch(r"(no|sin|ninguna?)\s+(hubo\s+)?(pausa|pausas|paramos|pausamos)", t):
+        return 0
+    # «1 hora» no se convierte solo: la pregunta pide minutos.
+    if re.search(r"\b(vasitos?|personas?|horas?)\b", t):
+        return None
+    nums = re.findall(r"\d+", t)
+    if len(set(nums)) != 1:
+        return None
+    n = int(nums[0])
+    if not 0 <= n <= 480:
+        return None
+    return n
+
+
+def resolver_personas_envasado(buffer: str, texto: str) -> dict:
+    """Junta el buffer de la pregunta con el mensaje nuevo. No avanza si no hay número."""
+    if _vacio_o_basura(texto, False):
+        return {"ok": False, "vacio": True, "buffer": buffer or ""}
+    texto = texto.strip()
+    previo = (buffer or "").strip()
+    completo = f"{previo}\n{texto}".strip() if previo else texto
+    n = _numero_personas(completo)
+    respuesta = completo
+    if n is None:
+        n_ultimo = _numero_personas(texto)
+        if n_ultimo is not None:
+            n = n_ultimo
+            respuesta = texto
+    if n is None:
+        return {"ok": False, "vacio": False, "buffer": completo}
+    return {
+        "ok": True,
+        "n": n,
+        "detalle": _detalle_personas(respuesta),
+        "respuesta": respuesta,
+        "buffer": "",
+    }
+
+
+def resolver_pausas_envasado(buffer: str, texto: str) -> dict:
+    if _vacio_o_basura(texto, False):
+        return {"ok": False, "vacio": True, "buffer": buffer or ""}
+    texto = texto.strip()
+    previo = (buffer or "").strip()
+    completo = f"{previo}\n{texto}".strip() if previo else texto
+    pausa = _minutos_pausa(completo)
+    respuesta = completo
+    if pausa is None:
+        pausa_ultima = _minutos_pausa(texto)
+        if pausa_ultima is not None:
+            pausa = pausa_ultima
+            respuesta = texto
+    if pausa is None:
+        return {"ok": False, "vacio": False, "buffer": completo}
+    return {"ok": True, "pausa": pausa, "respuesta": respuesta, "buffer": ""}
+
+
+def _tiene_tramo_util(datos: dict) -> bool:
+    for tramo in datos.get("tramos") or []:
+        if not isinstance(tramo, dict):
+            continue
+        if _duracion_minutos(tramo.get("inicio") or "", tramo.get("fin") or "") is not None:
+            return True
+    return False
+
+
+def _minutos_brutos_tramos(datos: dict) -> float:
+    """Suma de reloj de los tramos, sin restar pausas."""
+    total = 0.0
+    hubo = False
+    for tramo in datos.get("tramos") or []:
+        if not isinstance(tramo, dict):
+            continue
+        dur = _duracion_minutos(tramo.get("inicio") or "", tramo.get("fin") or "")
+        if dur is None:
+            continue
+        hubo = True
+        total += dur
+    if hubo:
+        return float(total)
+    try:
+        return float(datos.get("minutos_totales") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _tiene_tiempo_util(datos: dict) -> bool:
+    if _tiene_tramo_util(datos):
+        return True
+    try:
+        return float(datos.get("minutos_totales") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _extraccion_envasado_completa(data: dict, q8: str = "") -> bool:
+    """True si el JSON ya alcanza para decidir, y no hace falta reintentar."""
+    if not isinstance(data, dict) or not data:
+        return False
+    if _respuesta_sin_vasitos(q8):
+        return True
+    q8_simple = _vasitos_entero_simple(q8)
+    if q8_simple is not None and q8_simple <= 0:
+        return True
+    if q8_simple is not None and q8_simple > 0:
+        return _tiene_tiempo_util(data)
+    if data.get("hubo_envasado") is False and not _tiene_tiempo_util(data):
+        return False
+    try:
+        vasitos = float(str(data.get("vasitos")).replace(",", "."))
+    except (TypeError, ValueError):
+        return False
+    if vasitos <= 0:
+        return data.get("hubo_envasado") is False
+    return _tiene_tiempo_util(data)
+
+
+def _mensaje_fallo_meta_envasado(razon: str = "") -> str:
+    razon = (razon or "").strip()
+    if razon:
+        return f"{MENSAJE_FALLO_META_ENVASADO}\n_{razon}_"
+    return MENSAJE_FALLO_META_ENVASADO
+
+
+def calcular_envasado_vasitos(
+    datos: dict,
+    n_personas: Optional[int] = None,
+    pausa_minutos: Optional[float] = None,
+    personas_detalle: str = "",
+) -> Optional[dict]:
+    """
+    Horas y vasitos vienen de la extracción. El número de personas y la pausa
+    vienen de las preguntas explícitas: no se infieren de los nombres ni de
+    pausa_minutos que haya armado el modelo dentro de un tramo.
+
+    El promedio es tiempo neto / vasitos (no minutos-persona).
+    Tiempo neto = tiempo bruto de reloj − minutos de pausa.
+    """
+    if not isinstance(datos, dict) or not datos:
+        return {
+            "ok": False,
+            "motivo": "extraccion_vacia",
+            "mensaje": "No se pudieron interpretar las horas ni la cantidad de vasitos.",
+        }
+
+    if datos.get("hubo_envasado") is False:
+        return {
+            "ok": False,
+            "motivo": "no_vasitos",
+            "mensaje": "No se envasaron vasitos hoy: no hay promedio que calcular.",
+        }
 
     try:
         vasitos = int(round(float(str(datos.get("vasitos", 0)).replace(",", "."))))
@@ -823,43 +1121,36 @@ def calcular_envasado_vasitos(datos: dict) -> Optional[dict]:
             "mensaje": "No se envasaron vasitos hoy: no hay promedio que calcular.",
         }
 
-    n = datos.get("n_trabajadores")
     try:
-        n = int(n) if n is not None else 0
+        n = int(n_personas) if n_personas is not None else 0
     except (TypeError, ValueError):
         n = 0
-    nombres = datos.get("trabajadores") or []
-    if isinstance(nombres, str):
-        nombres = [nombres]
-    nombres = [str(x).strip() for x in nombres if str(x).strip()]
     if n <= 0:
-        n = len(nombres)
+        return {
+            "ok": False,
+            "motivo": "sin_personas",
+            "mensaje": "No quedó el número de personas que envasaron.",
+        }
 
-    minutos = 0.0
-    tramos_ok = []
-    for tramo in datos.get("tramos") or []:
-        if not isinstance(tramo, dict):
-            continue
-        dur = _duracion_minutos(tramo.get("inicio") or "", tramo.get("fin") or "")
-        if dur is None:
-            continue
-        try:
-            pausa = float(tramo.get("pausa_minutos") or 0)
-        except (TypeError, ValueError):
-            pausa = 0
-        neto = max(0.0, dur - pausa)
-        if neto <= 0:
-            continue
-        tramos_ok.append(neto)
-        minutos += neto
+    if pausa_minutos is None:
+        return {
+            "ok": False,
+            "motivo": "sin_pausa",
+            "mensaje": "No quedaron los minutos de pausa del envasado.",
+        }
+    try:
+        pausa = float(pausa_minutos)
+    except (TypeError, ValueError):
+        pausa = -1
+    if not isfinite(pausa) or pausa < 0:
+        return {
+            "ok": False,
+            "motivo": "sin_pausa",
+            "mensaje": "No quedaron los minutos de pausa del envasado.",
+        }
 
-    if minutos <= 0:
-        # Fallback si Grok mandó minutos_totales ya restando pausas
-        try:
-            minutos = float(datos.get("minutos_totales") or 0)
-        except (TypeError, ValueError):
-            minutos = 0
-    if minutos <= 0:
+    minutos_brutos = _minutos_brutos_tramos(datos)
+    if minutos_brutos <= 0:
         return {
             "ok": False,
             "motivo": "sin_tiempo",
@@ -869,7 +1160,21 @@ def calcular_envasado_vasitos(datos: dict) -> Optional[dict]:
             ),
         }
 
-    segundos = minutos * 60.0
+    neto = minutos_brutos - pausa
+    if neto <= 0:
+        return {
+            "ok": False,
+            "motivo": "pausa_cubre_tiempo",
+            "mensaje": (
+                f"La pausa indicada ({_fmt_duracion(pausa)}) cubre todo el tiempo "
+                f"de envasado ({_fmt_duracion(minutos_brutos)}), así que no queda "
+                "tiempo neto para el promedio."
+            ),
+            "minutos_brutos": minutos_brutos,
+            "pausa_minutos": pausa,
+        }
+
+    segundos = neto * 60.0
     seg_por_vasito = segundos / vasitos
     if not isfinite(seg_por_vasito) or seg_por_vasito <= 0:
         return {
@@ -878,17 +1183,22 @@ def calcular_envasado_vasitos(datos: dict) -> Optional[dict]:
             "mensaje": "No pude calcular el promedio de segundos por vasito.",
         }
 
-    meta = _meta_para_personas(n) if n else None
+    meta = _meta_para_personas(n)
     cumplio = None
     if meta is not None:
         cumplio = seg_por_vasito <= meta + 1e-9
 
+    detalle = (personas_detalle or "").strip()
+    pausa_out = int(pausa) if float(pausa).is_integer() else pausa
     return {
         "ok": True,
         "vasitos": vasitos,
         "n_trabajadores": n,
-        "trabajadores": nombres,
-        "minutos": minutos,
+        "personas_detalle": detalle,
+        "trabajadores": [detalle] if detalle else [],
+        "minutos_brutos": minutos_brutos,
+        "pausa_minutos": pausa_out,
+        "minutos": neto,
         "segundos": segundos,
         "seg_por_vasito": seg_por_vasito,
         "meta": meta,
@@ -897,19 +1207,26 @@ def calcular_envasado_vasitos(datos: dict) -> Optional[dict]:
 
 
 def formatear_calculo_envasado(calc: dict) -> str:
-    if not calc:
-        return ""
-    if not calc.get("ok"):
-        return f"📊 **Envasado de vasitos:** {calc.get('mensaje')}"
+    if not calc or not calc.get("ok"):
+        if calc and calc.get("motivo") == "no_vasitos":
+            return f"📊 **Envasado de vasitos:** {calc.get('mensaje')}"
+        return _mensaje_fallo_meta_envasado((calc or {}).get("mensaje") or "")
 
-    nombres = calc.get("trabajadores") or []
-    quienes = f" ({', '.join(nombres)})" if nombres else ""
     n = calc.get("n_trabajadores") or 0
+    detalle = (calc.get("personas_detalle") or "").strip()
+    if not detalle:
+        nombres = [str(x).strip() for x in (calc.get("trabajadores") or []) if str(x).strip()]
+        detalle = ", ".join(nombres)
+    quienes = f" ({detalle})" if detalle else ""
     personas = f"{n} persona" + ("" if n == 1 else "s") + quienes
+    bruto = calc.get("minutos_brutos", calc.get("minutos"))
+    pausa = calc.get("pausa_minutos") or 0
 
     lineas = [
         "📊 **Cálculo de envasado de vasitos**",
-        f"• Tiempo: {_fmt_duracion(calc['minutos'])} ({int(round(calc['segundos']))} s)",
+        f"• Tiempo bruto: {_fmt_duracion(bruto)} ({int(round(float(bruto) * 60))} s)",
+        f"• **Pausa descontada: {_fmt_duracion(pausa)}**",
+        f"• Tiempo neto: {_fmt_duracion(calc['minutos'])} ({int(round(calc['segundos']))} s)",
         f"• Vasitos: {calc['vasitos']}",
         f"• Personas: {personas}",
         f"• Promedio: **{_fmt_segundos_vasito(calc['seg_por_vasito'])} s/vasito**",
@@ -937,14 +1254,12 @@ def formatear_calculo_envasado(calc: dict) -> str:
                 f"❌ **No cumplieron la meta** "
                 f"({_fmt_segundos_vasito(-diff)} s por encima)."
             )
+    if float(pausa) > 0:
+        lineas.append(NOTA_PAUSA_TANIA)
     return "\n".join(lineas)
 
 
-async def extraer_datos_envasado_vasitos(answers: dict) -> dict:
-    """Grok solo extrae datos; el promedio y la meta se calculan en Python."""
-    q7 = answers.get(str(IDX_VASITOS_HORAS), "")
-    q8 = answers.get(str(IDX_VASITOS_CANTIDAD), "")
-    system_prompt = """
+_PROMPT_EXTRACCION_ENVASADO = """
 Eres extractor de datos de un reporte de cierre (fábrica de helados).
 NO calcules promedios ni metas. Solo extrae lo que dijeron.
 
@@ -952,68 +1267,182 @@ Responde ÚNICAMENTE JSON:
 {
   "hubo_envasado": true o false,
   "vasitos": número entero (0 si no hubo),
-  "n_trabajadores": número entero,
-  "trabajadores": ["Nombre", ...],
+  "n_trabajadores": null,
+  "trabajadores": [],
   "tramos": [
     {
       "etiqueta": "gourmet" o "trisabor" o "general" o null,
       "inicio": "HH:MM" en 24 horas,
       "fin": "HH:MM" en 24 horas,
-      "pausa_minutos": número (0 si no hay pausa)
+      "pausa_minutos": 0
     }
   ],
   "minutos_totales": número o null
 }
 
 Reglas:
-- Pregunta 7 = horas y quiénes envasaron VASITOS (no bandejas).
+- Pregunta 7 = horario del envasado de VASITOS (no bandejas). Puede traer nombres: no los uses para nada.
 - Pregunta 8 = cantidad de vasitos. Si hay desglose (Gourmet 434, Trisabor 415), SUMA tú el total en vasitos.
 - "729", "742 vasitos", "Trisabor:415 Gourmet:434" → vasitos numérico.
-- Horas: convierte a 24h. El envasado es de tarde: "3:20" → "15:20", "5:45pm" → "17:45".
-- Varios tramos (gourmet de X a Y, trisabor de A a B) van en "tramos" por separado.
-- Si hay pausa ("paramos 15 min", "de 4 a 4:20 no se envasó"), ponla en pausa_minutos de ese tramo o reparte.
-- minutos_totales: suma de tramos menos pausas, o null si no puedes.
-- n_trabajadores: cuántas personas distintas envasaron vasitos. "Angel, Luis y Yuselis" = 3.
-- hubo_envasado false si dijeron que no se envasaron vasitos / cero vasitos.
-- Typos y español de planta OK. No inventes horas ni nombres que no estén.
+- Horas: convierte a 24h. El envasado es de tarde: "3:20" → "15:20", "5:45pm" → "17:45", "6:15" → "18:15", "9:30" → "21:30".
+- El tramo es la hora de inicio y la de fin de reloj. NO recortes el horario por pausas.
+- Varios tramos (gourmet de X a Y, trisabor de A a B) van en "tramos" por separado, cada uno con su inicio y fin de reloj.
+- pausa_minutos de cada tramo: siempre 0. Las pausas se preguntan aparte y no se restan acá.
+- minutos_totales: suma de las duraciones de reloj, sin restar pausas, o null si no puedes.
+- n_trabajadores: null. trabajadores: []. No cuentes personas a partir de los nombres.
+- hubo_envasado false solo si dijeron que no se envasaron vasitos / cero vasitos.
+- Typos y español de planta OK. No inventes horas que no estén.
 """
+
+
+def _parse_json_objeto(raw: str) -> dict:
+    s = (raw or "").strip()
+    if not s:
+        raise ValueError("respuesta vacía de Grok")
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s*```$", "", s)
+        s = s.strip()
+    data = json.loads(s)
+    if not isinstance(data, dict):
+        raise ValueError("JSON de envasado no es un objeto")
+    return data
+
+
+def _solicitar_extraccion_envasado(user_content: str) -> str:
+    response = client.chat.completions.create(
+        model="grok-4-1-fast",
+        messages=[
+            {"role": "system", "content": _PROMPT_EXTRACCION_ENVASADO},
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0.0,
+        response_format={"type": "json_object"},
+        timeout=ENVASADO_EXTRACCION_TIMEOUT,
+    )
+    contenido = response.choices[0].message.content
+    if not contenido or not str(contenido).strip():
+        raise ValueError("respuesta vacía de Grok")
+    return contenido
+
+
+async def extraer_datos_envasado_vasitos(answers: dict) -> dict:
+    """Grok solo extrae horas y vasitos. Reintenta una vez si falla o viene incompleto.
+
+    Antes, cualquier error devolvía {} y el canal no se enteraba.
+    """
+    q7 = answers.get(str(IDX_VASITOS_HORAS), "")
+    q8 = answers.get(str(IDX_VASITOS_CANTIDAD), "")
     user_content = f"""
-Pregunta 7 (horas y trabajadores del envasado de vasitos):
+Pregunta 7 (horario del envasado de vasitos):
 \"\"\"{q7 or "(vacío)"}\"\"\"
 
 Pregunta 8 (cantidad de vasitos):
 \"\"\"{q8 or "(vacío)"}\"\"\"
 """
-    try:
-        response = client.chat.completions.create(
-            model="grok-4-1-fast",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0.0,
-            response_format={"type": "json_object"},
-        )
-        data = json.loads(response.choices[0].message.content)
-        if not isinstance(data, dict):
-            return {}
-        return data
-    except Exception as e:
-        print(f"Error al extraer datos de envasado: {e}")
-        traceback.print_exc()
-        return {}
+    ultimo: dict = {}
+    for intento in (1, 2):
+        try:
+            raw = _solicitar_extraccion_envasado(user_content)
+            data = _parse_json_objeto(raw)
+            if _extraccion_envasado_completa(data, q8):
+                return data
+            print(f"Extracción de envasado incompleta (intento {intento}): {data!r}")
+            ultimo = data
+        except Exception as e:
+            print(f"Error al extraer datos de envasado (intento {intento}): {e}")
+            traceback.print_exc()
+            ultimo = {}
+        if intento == 1:
+            await asyncio.sleep(ENVASADO_REINTENTO_ESPERA)
+    return ultimo
 
 
-async def mensaje_calculo_envasado(state: dict) -> Optional[str]:
-    datos = await extraer_datos_envasado_vasitos(state.get("answers") or {})
-    calc = calcular_envasado_vasitos(datos)
-    if not calc:
-        return None
-    state["calculo_envasado"] = {
-        k: v for k, v in calc.items() if k != "mensaje"
-    }
+def _guardar_calculo(state: dict, calc: dict, datos: dict) -> None:
+    state["calculo_envasado"] = {k: v for k, v in calc.items() if k != "mensaje"}
     state["calculo_envasado_datos"] = datos
+
+
+async def _armar_mensaje_calculo_envasado(state: dict) -> str:
+    answers = state.get("answers") or {}
+    q8 = answers.get(str(IDX_VASITOS_CANTIDAD), "")
+    if _respuesta_sin_vasitos(q8):
+        _guardar_calculo(
+            state,
+            {"ok": False, "motivo": "no_vasitos", "vasitos": 0},
+            {},
+        )
+        return MENSAJE_SIN_VASITOS
+
+    datos = await extraer_datos_envasado_vasitos(answers)
+    if not isinstance(datos, dict):
+        datos = {}
+    q8_simple = _vasitos_entero_simple(q8)
+    if q8_simple is not None:
+        datos = dict(datos)
+        datos["vasitos"] = q8_simple
+        if q8_simple > 0:
+            datos["hubo_envasado"] = True
+
+    n = state.get("vasitos_n_personas")
+    if n is None:
+        n = _numero_personas(answers.get(str(IDX_VASITOS_PERSONAS), ""))
+    pausa = state.get("vasitos_pausa_minutos")
+    if pausa is None:
+        pausa = _minutos_pausa(answers.get(str(IDX_VASITOS_PAUSAS), ""))
+    detalle = state.get("vasitos_personas_detalle") or ""
+    if not detalle:
+        detalle = _detalle_personas(answers.get(str(IDX_VASITOS_PERSONAS), ""))
+
+    if n is None or pausa is None or not _extraccion_envasado_completa(datos, q8):
+        _guardar_calculo(
+            state,
+            {
+                "ok": False,
+                "motivo": "extraccion_incompleta",
+                "mensaje": (
+                    "No se pudieron interpretar las horas, la cantidad de vasitos "
+                    "o los datos de la meta."
+                ),
+                "n_trabajadores": n,
+                "pausa_minutos": pausa,
+            },
+            datos,
+        )
+        return _mensaje_fallo_meta_envasado(
+            "No se pudieron interpretar las horas, la cantidad de vasitos o los datos de la meta."
+        )
+
+    calc = calcular_envasado_vasitos(
+        datos,
+        n_personas=n,
+        pausa_minutos=pausa,
+        personas_detalle=detalle,
+    )
+    if not calc:
+        _guardar_calculo(
+            state,
+            {
+                "ok": False,
+                "motivo": "extraccion_vacia",
+                "mensaje": "No se pudieron interpretar las horas ni la cantidad de vasitos.",
+            },
+            datos,
+        )
+        return MENSAJE_FALLO_META_ENVASADO
+    _guardar_calculo(state, calc, datos)
     return formatear_calculo_envasado(calc)
+
+
+async def mensaje_calculo_envasado(state: dict) -> str:
+    """Texto para el canal. Si el cálculo no se arma, avisa a Tania en vez de callar."""
+    try:
+        return await _armar_mensaje_calculo_envasado(state)
+    except Exception as e:
+        print(f"Error en cálculo de envasado: {e}")
+        traceback.print_exc()
+        state["calculo_envasado"] = {"ok": False, "motivo": "excepcion"}
+        return MENSAJE_FALLO_META_ENVASADO
 
 
 async def iniciar_reporte(channel: discord.abc.Messageable, user: discord.abc.User):
@@ -1253,6 +1682,10 @@ async def manejar_respuesta(message: discord.Message):
         await _manejar_gasoil_planta_azul(message, state, texto, tiene_adjuntos)
         return
 
+    if paso in (IDX_VASITOS_PERSONAS, IDX_VASITOS_PAUSAS):
+        await _manejar_personas_y_pausas_vasitos(message, state, texto)
+        return
+
     # Pre-filtro sin gastar tokens
     if _vacio_o_basura(texto, tiene_adjuntos):
         await message.channel.send(
@@ -1326,16 +1759,13 @@ async def manejar_respuesta(message: discord.Message):
     paso_completado = paso
     state["paso"] += 1
 
-    # Con horas (Q7) + total de vasitos (Q8) ya se puede calcular la meta
-    if paso_completado == IDX_VASITOS_CANTIDAD:
-        try:
-            resumen = await mensaje_calculo_envasado(state)
-        except Exception as e:
-            print(f"Error en cálculo de envasado: {e}")
-            traceback.print_exc()
-            resumen = None
-        if resumen:
-            await message.channel.send(resumen)
+    # Sin vasitos no hay meta: no se pregunta personas ni pausa.
+    if paso_completado == IDX_VASITOS_CANTIDAD and _respuesta_sin_vasitos(
+        state["answers"].get(str(IDX_VASITOS_CANTIDAD), "")
+    ):
+        state["paso"] = IDX_VASITOS_PAUSAS + 1
+        state["calculo_envasado"] = {"ok": False, "motivo": "no_vasitos", "vasitos": 0}
+        await message.channel.send(MENSAJE_SIN_VASITOS)
 
     if state["paso"] < len(PREGUNTAS):
         await message.channel.send(PREGUNTAS[state["paso"]]["texto"])
@@ -1352,5 +1782,68 @@ async def manejar_respuesta(message: discord.Message):
         del conversation_state[channel_id]
 
 
+# ================== PERSONAS Y PAUSAS DEL ENVASADO ==================
+_REPREGUNTA_PERSONAS = (
+    "Para no contar mal los nombres, escribe el número de personas. "
+    "Si quieres, agrega los nombres después "
+    "(ejemplo: 2, José Luis y Ángel).\n\n"
+)
+_REPREGUNTA_PAUSAS = (
+    "Escribe los minutos de pausa con un número. "
+    "Si no pausaron, escribe 0.\n\n"
+)
+
+
+async def _manejar_personas_y_pausas_vasitos(
+    message: discord.Message,
+    state: dict,
+    texto: str,
+) -> None:
+    paso = state["paso"]
+    if paso == IDX_VASITOS_PERSONAS:
+        decision = resolver_personas_envasado(state.get("buffer") or "", texto)
+        aviso = _REPREGUNTA_PERSONAS
+    else:
+        decision = resolver_pausas_envasado(state.get("buffer") or "", texto)
+        aviso = _REPREGUNTA_PAUSAS
+
+    if not decision["ok"]:
+        if not decision.get("vacio"):
+            state["buffer"] = decision["buffer"]
+        if decision.get("vacio"):
+            aviso = "Escribe la respuesta con un número.\n\n"
+        await message.channel.send(aviso + PREGUNTAS[paso]["texto"])
+        return
+
+    try:
+        await message.add_reaction("✅")
+    except Exception:
+        pass
+
+    state["answers"][str(paso)] = decision["respuesta"]
+    state["buffer"] = ""
+
+    if paso == IDX_VASITOS_PERSONAS:
+        state["vasitos_n_personas"] = decision["n"]
+        state["vasitos_personas_detalle"] = decision["detalle"]
+        state["paso"] = IDX_VASITOS_PAUSAS
+        await message.channel.send(PREGUNTAS[IDX_VASITOS_PAUSAS]["texto"])
+        return
+
+    state["vasitos_pausa_minutos"] = decision["pausa"]
+    state["paso"] = paso + 1
+    try:
+        resumen = await mensaje_calculo_envasado(state)
+    except Exception as e:
+        print(f"Error en cálculo de envasado: {e}")
+        traceback.print_exc()
+        resumen = MENSAJE_FALLO_META_ENVASADO
+    if not resumen:
+        resumen = MENSAJE_FALLO_META_ENVASADO
+    await message.channel.send(resumen)
+    await _preguntar_o_cerrar(message, state)
+
+
 # ================== INICIO ==================
-bot.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)
