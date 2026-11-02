@@ -48,15 +48,21 @@ class _Autor:
         self.bot = False
 
 
+class _Adjunto:
+    def __init__(self, filename):
+        self.filename = filename
+
+
 class _Msg:
-    def __init__(self, content, canal, user_id=7):
+    def __init__(self, content, canal, user_id=7, attachments=None):
         self.content = content
         self.channel = canal
         self.author = _Autor(user_id)
-        self.attachments = []
+        self.attachments = list(attachments or [])
+        self.reactions = []
 
     async def add_reaction(self, emoji):
-        return None
+        self.reactions.append(emoji)
 
 
 def _estado(paso, **extra):
@@ -78,7 +84,7 @@ async def _grok_valido(*_args, **_kwargs):
 class PreguntasYMetas(unittest.TestCase):
     def test_el_resto_del_reporte_sigue_en_su_lugar(self):
         textos = [p["texto"] for p in main.PREGUNTAS]
-        self.assertEqual(len(textos), 30)
+        self.assertEqual(len(textos), 31)
         prefijos = [
             "1. ¿Qué trabajadores alistaron los pedidos?",
             "2. ¿A qué clientes pertenecen los pedidos",
@@ -115,6 +121,13 @@ class PreguntasYMetas(unittest.TestCase):
                 "9. ¿A qué hora empezaste y terminaste la limpieza?"
             )
         )
+        self.assertTrue(
+            textos[main.IDX_BATIDORAS_FOTO - 1].startswith(
+                "10. ¿Limpiaste los tambores de las batidoras"
+            )
+        )
+        self.assertEqual(textos[main.IDX_BATIDORAS_FOTO], main.TEXTO_BATIDORAS_FOTO)
+        self.assertEqual(textos[main.IDX_BATIDORAS_FOTO + 1], main.TEXTO_PLANTA_AZUL_PRENDIDA)
         self.assertEqual(
             textos[main.IDX_PLANTA_AZUL_PRENDIDA], main.TEXTO_PLANTA_AZUL_PRENDIDA
         )
@@ -528,6 +541,85 @@ class Flujo(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["answers"]["7"], "673")
         self.assertEqual(state["paso"], idx + 1)
         self.assertIn("tambores", self.canal.mensajes[-1])
+
+    async def test_despues_de_limpiar_los_tambores_la_foto_es_obligatoria(self):
+        idx = main.IDX_BATIDORAS_FOTO - 1
+        state = self._poner(_estado(idx))
+
+        async def _grok_no_entra(*_args, **_kwargs):
+            raise AssertionError("la foto de las batidoras no se valida con Grok")
+
+        with patch("main.consultar_grok", _grok_valido):
+            await main.manejar_respuesta(_Msg("sí, limpios y sin sal", self.canal))
+        self.assertEqual(state["paso"], main.IDX_BATIDORAS_FOTO)
+        self.assertEqual(state["answers"][str(idx)], "sí, limpios y sin sal")
+        self.assertEqual(self.canal.mensajes[-1], main.TEXTO_BATIDORAS_FOTO)
+
+        with patch("main.consultar_grok", _grok_no_entra):
+            await main.manejar_respuesta(_Msg("sí", self.canal))
+            self.assertEqual(state["paso"], main.IDX_BATIDORAS_FOTO)
+            self.assertNotIn(str(main.IDX_BATIDORAS_FOTO), state["answers"])
+            self.assertEqual(state["buffer"], "sí")
+            self.assertIn("Falta la foto", self.canal.mensajes[-1])
+            self.assertIn(main.TEXTO_BATIDORAS_FOTO, self.canal.mensajes[-1])
+
+            await main.manejar_respuesta(_Msg(".", self.canal))
+            self.assertEqual(state["paso"], main.IDX_BATIDORAS_FOTO)
+            self.assertEqual(state["buffer"], "sí")
+
+            msg = _Msg("", self.canal, attachments=[_Adjunto("batidoras.jpg")])
+            await main.manejar_respuesta(msg)
+
+        guardado = state["answers"][str(main.IDX_BATIDORAS_FOTO)]
+        self.assertEqual(guardado, "sí\n[Adjuntos: batidoras.jpg]")
+        self.assertEqual(state["buffer"], "")
+        self.assertEqual(state["paso"], main.IDX_PLANTA_AZUL_PRENDIDA)
+        self.assertEqual(self.canal.mensajes[-1], main.TEXTO_PLANTA_AZUL_PRENDIDA)
+        self.assertEqual(msg.reactions, ["✅"])
+
+    async def test_varias_fotos_de_las_batidoras_en_el_mismo_mensaje(self):
+        state = self._poner(_estado(main.IDX_BATIDORAS_FOTO))
+        fotos = [_Adjunto(f"batidora-{n}.jpg") for n in (1, 2, 3, 4)]
+
+        async def _grok_no_entra(*_args, **_kwargs):
+            raise AssertionError("la foto de las batidoras no se valida con Grok")
+
+        with patch("main.consultar_grok", _grok_no_entra):
+            await main.manejar_respuesta(_Msg("las cuatro", self.canal, attachments=fotos))
+
+        guardado = state["answers"][str(main.IDX_BATIDORAS_FOTO)]
+        self.assertEqual(
+            guardado,
+            "las cuatro\n[Adjuntos: batidora-1.jpg, batidora-2.jpg, batidora-3.jpg, batidora-4.jpg]",
+        )
+        self.assertEqual(state["paso"], main.IDX_PLANTA_AZUL_PRENDIDA)
+        self.assertEqual(self.canal.mensajes[-1], main.TEXTO_PLANTA_AZUL_PRENDIDA)
+
+    async def test_la_foto_del_gasoil_sigue_exigiendo_el_adjunto(self):
+        state = self._poner(
+            _estado(main.IDX_GASOIL_AZUL_FOTO_NIVEL, gasoil_azul_lineas=5)
+        )
+
+        async def _grok_no_entra(*_args, **_kwargs):
+            raise AssertionError("la foto del gasoil no se valida con Grok")
+
+        with patch("main.consultar_grok", _grok_no_entra):
+            await main.manejar_respuesta(_Msg("ahí está", self.canal))
+            self.assertEqual(state["paso"], main.IDX_GASOIL_AZUL_FOTO_NIVEL)
+            self.assertIn("Falta la foto", self.canal.mensajes[-1])
+            self.assertEqual(state["buffer"], "ahí está")
+
+            await main.manejar_respuesta(
+                _Msg("", self.canal, attachments=[_Adjunto("nivel.jpg")])
+            )
+
+        self.assertEqual(
+            state["answers"][str(main.IDX_GASOIL_AZUL_FOTO_NIVEL)],
+            "ahí está\n[Adjuntos: nivel.jpg]",
+        )
+        self.assertEqual(state["paso"], main.IDX_ACEITE_AZUL)
+        self.assertTrue(self.canal.mensajes[-1].startswith("11. ¿Cuál es el nivel de aceite"))
+        self.assertNotIn("Debes colocarle gasoil", "\n".join(self.canal.mensajes))
 
     async def test_planta_azul_sigue_bifurcando(self):
         state = self._poner(_estado(main.IDX_PLANTA_AZUL_PRENDIDA))
