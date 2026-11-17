@@ -48,17 +48,16 @@ PEDIDOS_INICIO = 0
 PEDIDOS_FIN = 4  # preguntas 1..5 inclusive
 
 # Envasado de vasitos (0-based):
-# 6 = horario, 7 = cantidad, 8 = número de personas, 9 = minutos de pausa.
+# 6 = horario y personas, 7 = cantidad, 8 = pausas (de hora a hora).
 IDX_VASITOS_HORAS = 6
 IDX_VASITOS_CANTIDAD = 7
-IDX_VASITOS_PERSONAS = 8
-IDX_VASITOS_PAUSAS = 9
+IDX_VASITOS_PAUSAS = 8
 
 # Foto obligatoria de las cuatro batidoras, justo después de confirmar
 # que se limpiaron los tambores (pregunta 10). El texto solo no alcanza.
 # Vale una foto de las cuatro, o varias en el mismo mensaje. No mueve los
 # índices de pedidos ni de vasitos.
-IDX_BATIDORAS_FOTO = 12
+IDX_BATIDORAS_FOTO = 11
 TEXTO_BATIDORAS_FOTO = (
     "Envía una foto de las cuatro batidoras limpias. "
     "Si son varias, envíalas todas en el mismo mensaje."
@@ -68,10 +67,10 @@ TEXTO_BATIDORAS_FOTO = (
 # Prendida → líneas de antes de prenderla, y se saltan fotos, aceite y switch.
 # Apagada → líneas, foto del nivel, foto de recarga si < 4, aceite, foto de
 # aceite y, al final, el switch de la llave. La planta roja va justo después.
-IDX_PLANTA_AZUL_PRENDIDA = 13
-IDX_GASOIL_AZUL_LINEAS = 14
-IDX_GASOIL_AZUL_FOTO_NIVEL = 15
-IDX_GASOIL_AZUL_FOTO_RECARGA = 16
+IDX_PLANTA_AZUL_PRENDIDA = 12
+IDX_GASOIL_AZUL_LINEAS = 13
+IDX_GASOIL_AZUL_FOTO_NIVEL = 14
+IDX_GASOIL_AZUL_FOTO_RECARGA = 15
 GASOIL_AZUL_MIN_LINEAS = 4
 
 # Aceite planta azul, justo después del gasoil (la foto de recarga se salta
@@ -180,12 +179,15 @@ PREGUNTAS = [
     {
         "texto": (
             "7. ¿A qué hora empezaste y terminaste el envasado de vasitos? "
-            "¿Qué trabajadores se encargaron del envasado de vasitos?"
+            "¿Cuántas personas envasaron y quiénes fueron? "
+            "(ejemplo: 2, José Luis y Ángel)"
         ),
         "reglas": """
-- Igual que bandejas: horas + trabajadores.
+- Válido si trae hora inicio, hora fin (o tramos) Y el número de personas.
+- Los nombres van con el número (ejemplo: "7:00 a 9:00, 2, José Luis y Ángel").
+- Nombres solos, sin número, no alcanzan.
 - Acepta tramos (gourmet de X a Y, trisabor de A a B).
-- Si no se envasaron vasitos hoy, "no hubo / no se envasaron" ES válido.
+- Si no se envasaron vasitos hoy, "no hubo / no se envasaron" ES válido y no exijas horas ni personas.
 """,
     },
     {
@@ -199,26 +201,17 @@ PREGUNTAS = [
     },
     {
         "texto": (
-            "¿Cuántas personas envasaron los vasitos? "
-            "Escribe el número. Si quieres, agrega los nombres después "
-            "(ejemplo: 2, José Luis y Ángel)."
+            "¿Hubo pausas durante el envasado de vasitos? "
+            "Si hubo, escribe de qué hora a qué hora fue cada una "
+            "(ejemplo: de 10:15 a 10:30 y de 12:00 a 12:20). "
+            "Si no pausaron, escribe NO."
         ),
         "reglas": """
 - Esta pregunta la resuelve el bot en código, no Grok.
-- Válido solo con un número entero de personas (1 a 20).
-- Nombres solos, sin número, no alcanzan: hay que volver a pedir el número.
-- Ejemplo válido: "2, José Luis y Ángel".
-""",
-    },
-    {
-        "texto": (
-            "¿Cuántos minutos pausaron durante el envasado de vasitos? "
-            "Si no pausaron, escribe 0."
-        ),
-        "reglas": """
-- Esta pregunta la resuelve el bot en código, no Grok.
-- Válido: minutos con un número, de 0 a 480. 0 si no hubo pausa.
-- "no", "ninguna" y "sin pausa" cuentan como 0.
+- Si no pausaron: "no", "ninguna", "sin pausa" o "0" valen como 0 minutos.
+- Si pausaron: de qué hora a qué hora fue cada pausa. El bot suma los minutos.
+- Solo un número de minutos, sin horas, no alcanza: hay que volver a pedir el tramo.
+- Un tramo que termina antes de empezar, o una suma de más de 480 minutos, no vale.
 """,
     },
     {
@@ -1048,22 +1041,81 @@ def resolver_personas_envasado(buffer: str, texto: str) -> dict:
     }
 
 
+_HORA_RELOJ = r"\d{1,2}[:.]\d{2}(?:\s*(?:a\.m\.?|p\.m\.?|am|pm))?"
+_RE_HORA_RELOJ = re.compile(_HORA_RELOJ, re.IGNORECASE)
+_RE_TRAMO_RELOJ = re.compile(
+    rf"(?:\bde\s+)?{_HORA_RELOJ}\s*(?:a|hasta|–|—|-)\s*(?:las?\s+)?{_HORA_RELOJ}",
+    re.IGNORECASE,
+)
+
+
+def _sin_reloj_para_personas(texto: str) -> str:
+    """Quita las horas para contar personas con las funciones que ya existen."""
+    t = _RE_TRAMO_RELOJ.sub(" ", texto or "")
+    return _RE_HORA_RELOJ.sub(" ", t)
+
+
+def _personas_en_respuesta_horario(buffer: str, texto: str) -> dict:
+    return resolver_personas_envasado(
+        _sin_reloj_para_personas(buffer),
+        _sin_reloj_para_personas(texto),
+    )
+
+
+def _hora_pausa_visible(token: str) -> str:
+    t = re.sub(r"\s+", " ", (token or "").strip())
+    return re.sub(r"(\d)\.(\d{2})", r"\1:\2", t)
+
+
+def _tramos_pausa(texto: str):
+    """Suma tramos de reloj. None si no hay pares claros, uno termina antes o pasa de 480."""
+    encontrados = list(_RE_HORA_RELOJ.finditer(texto or ""))
+    if not encontrados or len(encontrados) % 2 != 0:
+        return None
+    if re.search(r"\d", _RE_HORA_RELOJ.sub(" ", texto or "")):
+        return None
+    tramos = []
+    total = 0
+    for i in range(0, len(encontrados), 2):
+        a_raw = encontrados[i].group(0)
+        b_raw = encontrados[i + 1].group(0)
+        t0 = _a_minutos(a_raw)
+        t1 = _a_minutos(b_raw)
+        if t0 is None or t1 is None or t1 <= t0:
+            return None
+        total += t1 - t0
+        tramos.append((_hora_pausa_visible(a_raw), _hora_pausa_visible(b_raw)))
+    if total > 480:
+        return None
+    detalle = " y ".join(f"de {a} a {b}" for a, b in tramos)
+    return {"pausa": total, "detalle": detalle}
+
+
 def resolver_pausas_envasado(buffer: str, texto: str) -> dict:
     if _vacio_o_basura(texto, False):
         return {"ok": False, "vacio": True, "buffer": buffer or ""}
     texto = texto.strip()
     previo = (buffer or "").strip()
     completo = f"{previo}\n{texto}".strip() if previo else texto
-    pausa = _minutos_pausa(completo)
-    respuesta = completo
-    if pausa is None:
-        pausa_ultima = _minutos_pausa(texto)
-        if pausa_ultima is not None:
-            pausa = pausa_ultima
-            respuesta = texto
-    if pausa is None:
+
+    def _resolver_uno(t: str):
+        if _minutos_pausa(t) == 0:
+            return {"pausa": 0, "detalle": "", "respuesta": t}
+        tramos = _tramos_pausa(t)
+        if not tramos:
+            return None
+        return {
+            "pausa": tramos["pausa"],
+            "detalle": tramos["detalle"],
+            "respuesta": t,
+        }
+
+    res = _resolver_uno(completo)
+    if res is None and texto != completo:
+        res = _resolver_uno(texto)
+    if res is None:
         return {"ok": False, "vacio": False, "buffer": completo}
-    return {"ok": True, "pausa": pausa, "respuesta": respuesta, "buffer": ""}
+    return {"ok": True, "buffer": "", **res}
 
 
 def _tiene_tramo_util(datos: dict) -> bool:
@@ -1282,6 +1334,12 @@ def formatear_calculo_envasado(calc: dict) -> str:
         f"• Personas: {personas}",
         f"• Promedio: **{_fmt_segundos_vasito(calc['seg_por_vasito'])} s/vasito**",
     ]
+    texto_pausas = (calc.get("pausas_detalle") or "").strip()
+    if texto_pausas:
+        lineas.insert(
+            3,
+            f"• Pausas: {texto_pausas} ({int(round(float(pausa)))} min)",
+        )
     meta = calc.get("meta")
     if meta is None:
         if n <= 0:
@@ -1436,14 +1494,27 @@ async def _armar_mensaje_calculo_envasado(state: dict) -> str:
             datos["hubo_envasado"] = True
 
     n = state.get("vasitos_n_personas")
-    if n is None:
-        n = _numero_personas(answers.get(str(IDX_VASITOS_PERSONAS), ""))
-    pausa = state.get("vasitos_pausa_minutos")
-    if pausa is None:
-        pausa = _minutos_pausa(answers.get(str(IDX_VASITOS_PAUSAS), ""))
     detalle = state.get("vasitos_personas_detalle") or ""
-    if not detalle:
-        detalle = _detalle_personas(answers.get(str(IDX_VASITOS_PERSONAS), ""))
+    if n is None or not detalle:
+        decision_personas = _personas_en_respuesta_horario(
+            "", answers.get(str(IDX_VASITOS_HORAS), "")
+        )
+        if decision_personas.get("ok"):
+            if n is None:
+                n = decision_personas["n"]
+            if not detalle:
+                detalle = decision_personas.get("detalle") or ""
+    pausa = state.get("vasitos_pausa_minutos")
+    detalle_pausas = state.get("vasitos_pausas_detalle") or ""
+    if pausa is None or (pausa and not detalle_pausas):
+        decision_pausa = resolver_pausas_envasado(
+            "", answers.get(str(IDX_VASITOS_PAUSAS), "")
+        )
+        if decision_pausa.get("ok"):
+            if pausa is None:
+                pausa = decision_pausa["pausa"]
+            if not detalle_pausas:
+                detalle_pausas = decision_pausa.get("detalle") or ""
 
     if n is None or pausa is None or not _extraccion_envasado_completa(datos, q8):
         _guardar_calculo(
@@ -1481,6 +1552,8 @@ async def _armar_mensaje_calculo_envasado(state: dict) -> str:
             datos,
         )
         return MENSAJE_FALLO_META_ENVASADO
+    if calc.get("ok") and detalle_pausas:
+        calc["pausas_detalle"] = detalle_pausas
     _guardar_calculo(state, calc, datos)
     return formatear_calculo_envasado(calc)
 
@@ -1737,7 +1810,7 @@ async def manejar_respuesta(message: discord.Message):
         await _manejar_gasoil_planta_azul(message, state, texto, tiene_adjuntos)
         return
 
-    if paso in (IDX_VASITOS_PERSONAS, IDX_VASITOS_PAUSAS):
+    if paso == IDX_VASITOS_PAUSAS:
         await _manejar_personas_y_pausas_vasitos(message, state, texto)
         return
 
@@ -1754,6 +1827,14 @@ async def manejar_respuesta(message: discord.Message):
         buffer_completo = (state["buffer"] + "\n" + texto).strip()
     else:
         buffer_completo = texto
+
+    personas_q7 = None
+    if paso == IDX_VASITOS_HORAS and not _respuesta_sin_vasitos(buffer_completo):
+        personas_q7 = _personas_en_respuesta_horario(state.get("buffer") or "", texto)
+        if not personas_q7.get("ok"):
+            state["buffer"] = buffer_completo
+            await message.channel.send(_REPREGUNTA_PERSONAS + pregunta_item["texto"])
+            return
 
     # Nota de adjuntos en el texto enviado a Grok
     respuesta_para_ia = texto
@@ -1794,6 +1875,9 @@ async def manejar_respuesta(message: discord.Message):
     # Guardar respuesta (buffer + nueva)
     state["answers"][str(paso)] = buffer_completo
     state["buffer"] = ""
+    if personas_q7 and personas_q7.get("ok"):
+        state["vasitos_n_personas"] = personas_q7["n"]
+        state["vasitos_personas_detalle"] = personas_q7["detalle"]
 
     # Saltar bloque pedidos si aplica
     if decision.get("skip_bloque_pedidos") and paso <= PEDIDOS_FIN:
@@ -1814,7 +1898,7 @@ async def manejar_respuesta(message: discord.Message):
     paso_completado = paso
     state["paso"] += 1
 
-    # Sin vasitos no hay meta: no se pregunta personas ni pausa.
+    # Sin vasitos no hay meta: no se pregunta la pausa.
     if paso_completado == IDX_VASITOS_CANTIDAD and _respuesta_sin_vasitos(
         state["answers"].get(str(IDX_VASITOS_CANTIDAD), "")
     ):
@@ -1844,8 +1928,8 @@ _REPREGUNTA_PERSONAS = (
     "(ejemplo: 2, José Luis y Ángel).\n\n"
 )
 _REPREGUNTA_PAUSAS = (
-    "Escribe los minutos de pausa con un número. "
-    "Si no pausaron, escribe 0.\n\n"
+    "Para verificar en cámaras, escribe de qué hora a qué hora fue cada pausa "
+    "(ejemplo: de 10:15 a 10:30). Si no pausaron, escribe NO.\n\n"
 )
 
 
@@ -1855,18 +1939,12 @@ async def _manejar_personas_y_pausas_vasitos(
     texto: str,
 ) -> None:
     paso = state["paso"]
-    if paso == IDX_VASITOS_PERSONAS:
-        decision = resolver_personas_envasado(state.get("buffer") or "", texto)
-        aviso = _REPREGUNTA_PERSONAS
-    else:
-        decision = resolver_pausas_envasado(state.get("buffer") or "", texto)
-        aviso = _REPREGUNTA_PAUSAS
+    decision = resolver_pausas_envasado(state.get("buffer") or "", texto)
+    aviso = _REPREGUNTA_PAUSAS
 
     if not decision["ok"]:
         if not decision.get("vacio"):
             state["buffer"] = decision["buffer"]
-        if decision.get("vacio"):
-            aviso = "Escribe la respuesta con un número.\n\n"
         await message.channel.send(aviso + PREGUNTAS[paso]["texto"])
         return
 
@@ -1877,15 +1955,8 @@ async def _manejar_personas_y_pausas_vasitos(
 
     state["answers"][str(paso)] = decision["respuesta"]
     state["buffer"] = ""
-
-    if paso == IDX_VASITOS_PERSONAS:
-        state["vasitos_n_personas"] = decision["n"]
-        state["vasitos_personas_detalle"] = decision["detalle"]
-        state["paso"] = IDX_VASITOS_PAUSAS
-        await message.channel.send(PREGUNTAS[IDX_VASITOS_PAUSAS]["texto"])
-        return
-
     state["vasitos_pausa_minutos"] = decision["pausa"]
+    state["vasitos_pausas_detalle"] = decision.get("detalle") or ""
     state["paso"] = paso + 1
     try:
         resumen = await mensaje_calculo_envasado(state)

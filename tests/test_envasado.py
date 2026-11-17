@@ -84,7 +84,7 @@ async def _grok_valido(*_args, **_kwargs):
 class PreguntasYMetas(unittest.TestCase):
     def test_el_resto_del_reporte_sigue_en_su_lugar(self):
         textos = [p["texto"] for p in main.PREGUNTAS]
-        self.assertEqual(len(textos), 31)
+        self.assertEqual(len(textos), 30)
         prefijos = [
             "1. ¿Qué trabajadores alistaron los pedidos?",
             "2. ¿A qué clientes pertenecen los pedidos",
@@ -113,9 +113,13 @@ class PreguntasYMetas(unittest.TestCase):
             self.assertEqual(sum(1 for t in textos if t.startswith(prefijo)), 1, prefijo)
 
         self.assertTrue(textos[main.IDX_VASITOS_HORAS].startswith("7. "))
+        self.assertIn(
+            "¿Cuántas personas envasaron y quiénes fueron? (ejemplo: 2, José Luis y Ángel)",
+            textos[main.IDX_VASITOS_HORAS],
+        )
         self.assertTrue(textos[main.IDX_VASITOS_CANTIDAD].startswith("8. "))
-        self.assertIn("Cuántas personas envasaron", textos[main.IDX_VASITOS_PERSONAS])
-        self.assertIn("minutos pausaron", textos[main.IDX_VASITOS_PAUSAS])
+        self.assertNotIn("Cuántas personas envasaron los vasitos", "\n".join(textos))
+        self.assertIn("Hubo pausas durante el envasado", textos[main.IDX_VASITOS_PAUSAS])
         self.assertTrue(
             textos[main.IDX_VASITOS_PAUSAS + 1].startswith(
                 "9. ¿A qué hora empezaste y terminaste la limpieza?"
@@ -179,6 +183,35 @@ class PreguntasYMetas(unittest.TestCase):
         self.assertEqual(main._vasitos_entero_simple("673"), 673)
         self.assertEqual(main._vasitos_entero_simple("742 vasitos"), 742)
         self.assertIsNone(main._vasitos_entero_simple("Trisabor:415 Gourmet:258"))
+
+    def test_pausas_por_horario(self):
+        for texto in ("NO", "no", "ninguna", "sin pausa", "0"):
+            r = main.resolver_pausas_envasado("", texto)
+            self.assertTrue(r["ok"], texto)
+            self.assertEqual(r["pausa"], 0, texto)
+            self.assertEqual(r["detalle"], "", texto)
+
+        dos = main.resolver_pausas_envasado(
+            "", "de 10:15 a 10:30 y de 12:00 a 12:20"
+        )
+        self.assertTrue(dos["ok"])
+        self.assertEqual(dos["pausa"], 35)
+        self.assertEqual(dos["detalle"], "de 10:15 a 10:30 y de 12:00 a 12:20")
+
+        solo = main.resolver_pausas_envasado("", "15")
+        self.assertFalse(solo["ok"])
+
+        self.assertEqual(main.resolver_pausas_envasado("", "10.15 a 10.30")["pausa"], 15)
+        self.assertEqual(
+            main.resolver_pausas_envasado("", "10:15 pm a 10:30 pm")["pausa"], 15
+        )
+        self.assertEqual(
+            main.resolver_pausas_envasado("", "10:15am a 10:45am")["pausa"], 30
+        )
+        self.assertEqual(main.resolver_pausas_envasado("", "22:15 a 22:20")["pausa"], 5)
+        self.assertEqual(main.resolver_pausas_envasado("", "de 8:00 a 16:00")["pausa"], 480)
+        self.assertFalse(main.resolver_pausas_envasado("", "de 10:30 a 10:15")["ok"])
+        self.assertFalse(main.resolver_pausas_envasado("", "de 8:00 a 16:01")["ok"])
 
     def test_buffer_de_personas_no_se_traba(self):
         primero = main.resolver_personas_envasado("", "José Luis y ángel")
@@ -386,10 +419,9 @@ class Extraccion(unittest.IsolatedAsyncioTestCase):
 
         state = {
             "answers": {
-                "6": "José Luis y ángel de 6:15 a 9:30",
+                "6": "de 6:15 a 9:30, 2, José Luis y Ángel",
                 "7": "673",
-                "8": "2, José Luis y Ángel",
-                "9": "15 minutos",
+                "8": "de 10:00 a 10:15",
             }
         }
         with patch("main._solicitar_extraccion_envasado", solicitar):
@@ -434,6 +466,8 @@ class Flujo(unittest.IsolatedAsyncioTestCase):
             _estado(
                 main.IDX_VASITOS_CANTIDAD,
                 answers={"6": "José Luis y ángel de 6:15 a 9:30"},
+                vasitos_n_personas=2,
+                vasitos_personas_detalle="José Luis y ángel",
             )
         )
 
@@ -444,27 +478,10 @@ class Flujo(unittest.IsolatedAsyncioTestCase):
             "main._solicitar_extraccion_envasado", solicitar
         ):
             await main.manejar_respuesta(_Msg("673", self.canal))
-            self.assertEqual(state["paso"], main.IDX_VASITOS_PERSONAS)
+            self.assertEqual(state["paso"], main.IDX_VASITOS_PAUSAS)
             self.assertEqual(state["answers"]["7"], "673")
             self.assertNotIn("calculo_envasado", state)
-            self.assertIn("Cuántas personas", self.canal.mensajes[-1])
-
-            await main.manejar_respuesta(_Msg("José Luis y ángel", self.canal))
-            self.assertEqual(state["paso"], main.IDX_VASITOS_PERSONAS)
-            self.assertNotIn("8", state["answers"])
-            self.assertEqual(state["buffer"], "José Luis y ángel")
-            self.assertIn("número de personas", self.canal.mensajes[-1])
-
-            await main.manejar_respuesta(_Msg(".", self.canal))
-            self.assertEqual(state["buffer"], "José Luis y ángel")
-            self.assertEqual(state["paso"], main.IDX_VASITOS_PERSONAS)
-
-            await main.manejar_respuesta(_Msg("2", self.canal))
-            self.assertEqual(state["vasitos_n_personas"], 2)
-            self.assertIn("ángel", state["vasitos_personas_detalle"])
-            self.assertEqual(state["buffer"], "")
-            self.assertEqual(state["paso"], main.IDX_VASITOS_PAUSAS)
-            self.assertIn("minutos pausaron", self.canal.mensajes[-1])
+            self.assertIn("Hubo pausas", self.canal.mensajes[-1])
 
             await main.manejar_respuesta(_Msg("0", self.canal))
 
@@ -645,8 +662,109 @@ class Flujo(unittest.IsolatedAsyncioTestCase):
         self.assertIn("foto del nivel de gasoil", self.canal.mensajes[-1])
         self.assertEqual(state["answers"][str(main.IDX_GASOIL_AZUL_LINEAS)], "3.5")
 
-    async def test_cancelar_un_reporte_en_la_pregunta_de_personas(self):
-        self._poner(_estado(main.IDX_VASITOS_PERSONAS, answers={"7": "673"}))
+    async def test_pregunta_7_con_numero_no_pregunta_personas_aparte(self):
+        state = self._poner(_estado(main.IDX_VASITOS_HORAS))
+        with patch("main.consultar_grok", _grok_valido):
+            await main.manejar_respuesta(
+                _Msg("7:00 a 9:00, 2, José Luis y Ángel", self.canal)
+            )
+        self.assertEqual(state["vasitos_n_personas"], 2)
+        self.assertEqual(state["vasitos_personas_detalle"], "José Luis y Ángel")
+        self.assertEqual(state["answers"]["6"], "7:00 a 9:00, 2, José Luis y Ángel")
+        self.assertEqual(state["paso"], main.IDX_VASITOS_CANTIDAD)
+        self.assertTrue(self.canal.mensajes[-1].startswith("8. ¿Cuántos vasitos"))
+        self.assertNotIn(
+            "Cuántas personas envasaron los vasitos",
+            "\n".join(self.canal.mensajes),
+        )
+
+    async def test_pregunta_7_con_solo_nombres_repite_el_numero(self):
+        state = self._poner(_estado(main.IDX_VASITOS_HORAS))
+        with patch("main.consultar_grok", _grok_valido):
+            await main.manejar_respuesta(_Msg("José Luis y Ángel", self.canal))
+        self.assertEqual(state["paso"], main.IDX_VASITOS_HORAS)
+        self.assertNotIn("vasitos_n_personas", state)
+        self.assertNotIn("6", state["answers"])
+        self.assertIn("número de personas", self.canal.mensajes[-1])
+
+    async def test_sin_vasitos_no_pide_numero_ni_pausa(self):
+        state = self._poner(_estado(main.IDX_VASITOS_HORAS))
+        with patch("main.consultar_grok", _grok_valido):
+            await main.manejar_respuesta(_Msg("no hubo", self.canal))
+            self.assertEqual(state["paso"], main.IDX_VASITOS_CANTIDAD)
+            self.assertNotIn("vasitos_n_personas", state)
+            self.assertNotIn("número de personas", "\n".join(self.canal.mensajes))
+
+            await main.manejar_respuesta(_Msg("no se envasaron vasitos", self.canal))
+        self.assertEqual(state["paso"], main.IDX_VASITOS_PAUSAS + 1)
+        unidos = "\n".join(self.canal.mensajes)
+        self.assertNotIn("Hubo pausas durante el envasado", unidos)
+        self.assertNotIn("número de personas", unidos)
+        self.assertTrue(self.canal.mensajes[-1].startswith("9. "))
+
+    async def test_pausa_solo_minutos_se_repite(self):
+        state = self._poner(
+            _estado(main.IDX_VASITOS_PAUSAS, vasitos_n_personas=2)
+        )
+        await main.manejar_respuesta(_Msg("15", self.canal))
+        self.assertEqual(state["paso"], main.IDX_VASITOS_PAUSAS)
+        self.assertNotIn("vasitos_pausa_minutos", state)
+        self.assertIn("Para verificar en cámaras", self.canal.mensajes[-1])
+        self.assertIn("de 10:15 a 10:30", self.canal.mensajes[-1])
+
+    async def test_pausa_no_vale_cero(self):
+        state = self._poner(
+            _estado(
+                main.IDX_VASITOS_PAUSAS,
+                answers={"6": "de 6:15 a 9:30, 2, José Luis y Ángel", "7": "673"},
+                vasitos_n_personas=2,
+                vasitos_personas_detalle="José Luis y Ángel",
+            )
+        )
+
+        def solicitar(_contenido):
+            return json.dumps(_datos_horario())
+
+        with patch("main._solicitar_extraccion_envasado", solicitar):
+            await main.manejar_respuesta(_Msg("NO", self.canal))
+        self.assertEqual(state["vasitos_pausa_minutos"], 0)
+        self.assertEqual(state["vasitos_pausas_detalle"], "")
+        self.assertEqual(state["calculo_envasado"]["pausa_minutos"], 0)
+        self.assertIn("Pausa descontada: 0 min", self.canal.mensajes[-2])
+        self.assertNotIn("Pausas:", self.canal.mensajes[-2])
+
+    async def test_dos_tramos_de_pausa_suman_35_y_se_muestran(self):
+        state = self._poner(
+            _estado(
+                main.IDX_VASITOS_PAUSAS,
+                answers={"6": "de 6:15 a 9:30, 2, José Luis y Ángel", "7": "673"},
+                vasitos_n_personas=2,
+                vasitos_personas_detalle="José Luis y Ángel",
+            )
+        )
+
+        def solicitar(_contenido):
+            return json.dumps(_datos_horario())
+
+        with patch("main._solicitar_extraccion_envasado", solicitar):
+            await main.manejar_respuesta(
+                _Msg("de 10:15 a 10:30 y de 12:00 a 12:20", self.canal)
+            )
+        self.assertEqual(state["vasitos_pausa_minutos"], 35)
+        self.assertEqual(
+            state["vasitos_pausas_detalle"],
+            "de 10:15 a 10:30 y de 12:00 a 12:20",
+        )
+        self.assertEqual(state["calculo_envasado"]["pausa_minutos"], 35)
+        self.assertIn(
+            "Pausas: de 10:15 a 10:30 y de 12:00 a 12:20 (35 min)",
+            self.canal.mensajes[-2],
+        )
+        self.assertIn("Pausa descontada: 35 min", self.canal.mensajes[-2])
+        self.assertTrue(self.canal.mensajes[-1].startswith("9. "))
+
+    async def test_cancelar_un_reporte_en_la_pregunta_de_vasitos(self):
+        self._poner(_estado(main.IDX_VASITOS_HORAS, answers={"7": "673"}))
         await main.on_message(_Msg("cancelar", self.canal))
         self.assertNotIn(str(self.canal.id), main.conversation_state)
         self.assertIn("cancelado", self.canal.mensajes[-1])
