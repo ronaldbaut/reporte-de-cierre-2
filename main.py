@@ -1068,7 +1068,7 @@ def _hora_pausa_visible(token: str) -> str:
 
 
 def _tramos_pausa(texto: str):
-    """Suma tramos de reloj. None si no hay pares claros, uno termina antes o pasa de 480."""
+    """Suma tramos de reloj. None si no hay pares claros o el total pasa de 480."""
     encontrados = list(_RE_HORA_RELOJ.finditer(texto or ""))
     if not encontrados or len(encontrados) % 2 != 0:
         return None
@@ -1079,11 +1079,12 @@ def _tramos_pausa(texto: str):
     for i in range(0, len(encontrados), 2):
         a_raw = encontrados[i].group(0)
         b_raw = encontrados[i + 1].group(0)
-        t0 = _a_minutos(a_raw)
-        t1 = _a_minutos(b_raw)
-        if t0 is None or t1 is None or t1 <= t0:
+        # Misma regla que el horario del envasado: si el fin queda antes del
+        # inicio (7:56 → 19:56 pero 8:00 → 08:00), se suma 12 h al fin.
+        dur = _duracion_minutos(a_raw, b_raw)
+        if dur is None or dur <= 0:
             return None
-        total += t1 - t0
+        total += dur
         tramos.append((_hora_pausa_visible(a_raw), _hora_pausa_visible(b_raw)))
     if total > 480:
         return None
