@@ -213,6 +213,28 @@ class PreguntasYMetas(unittest.TestCase):
         self.assertFalse(main.resolver_pausas_envasado("", "de 10:30 a 10:15")["ok"])
         self.assertFalse(main.resolver_pausas_envasado("", "de 8:00 a 16:01")["ok"])
 
+    def test_pausa_que_cruza_las_8_de_la_noche(self):
+        # 18/11: Ángel respondió esto y el bot se quedó repreguntando,
+        # porque 7:56 se leía 19:56 y 8:00 se leía 08:00.
+        for texto in (
+            "de 5:35 a 5:40 y de 7:56 a 8:00",
+            "de 5:35 a 5:40 y otra de 7:56 a 8:00",
+            "Hubieron dos pausas de 5:35 a 5:40 y otra de 7:56 a 8:00",
+        ):
+            r = main.resolver_pausas_envasado("", texto)
+            self.assertTrue(r["ok"], texto)
+            self.assertEqual(r["pausa"], 9, texto)
+            self.assertEqual(r["detalle"], "de 5:35 a 5:40 y de 7:56 a 8:00", texto)
+        self.assertEqual(main.resolver_pausas_envasado("", "de 7:50 a 8:10")["pausa"], 20)
+        self.assertEqual(main.resolver_pausas_envasado("", "de 11:50 a 12:10")["pausa"], 20)
+        self.assertEqual(main.resolver_pausas_envasado("", "de 7:56 pm a 8:00 pm")["pausa"], 4)
+
+    def test_pausa_tras_varios_intentos_fallidos_se_acepta(self):
+        buffer = "de 5:35 a 5:40 y de 7:56\nSi hicimos pausas"
+        r = main.resolver_pausas_envasado(buffer, "de 5:35 a 5:40 y de 7:56 a 8:00")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["pausa"], 9)
+
     def test_buffer_de_personas_no_se_traba(self):
         primero = main.resolver_personas_envasado("", "José Luis y ángel")
         self.assertFalse(primero["ok"])
@@ -732,6 +754,32 @@ class Flujo(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["calculo_envasado"]["pausa_minutos"], 0)
         self.assertIn("Pausa descontada: 0 min", self.canal.mensajes[-2])
         self.assertNotIn("Pausas:", self.canal.mensajes[-2])
+
+    async def test_pausas_de_angel_18_nov_avanzan(self):
+        state = self._poner(
+            _estado(
+                main.IDX_VASITOS_PAUSAS,
+                answers={"6": "De 4:55 hasta las 8:33 se encargaron 3 personas", "7": "747"},
+                vasitos_n_personas=3,
+                vasitos_personas_detalle="",
+            )
+        )
+
+        def solicitar(_contenido):
+            return json.dumps(
+                _datos_horario(inicio="4:55", fin="8:33", vasitos=747, n_grok=3, pausa_tramo=0)
+            )
+
+        with patch("main._solicitar_extraccion_envasado", solicitar):
+            await main.manejar_respuesta(
+                _Msg("Hubieron dos pausas de 5:35 a 5:40 y otra de 7:56 a 8:00", self.canal)
+            )
+        self.assertEqual(state["paso"], main.IDX_VASITOS_PAUSAS + 1)
+        self.assertEqual(state["vasitos_pausa_minutos"], 9)
+        self.assertEqual(state["calculo_envasado"]["pausa_minutos"], 9)
+        unidos = "\n".join(self.canal.mensajes)
+        self.assertIn("Pausas: de 5:35 a 5:40 y de 7:56 a 8:00 (9 min)", unidos)
+        self.assertNotIn("Para verificar en cámaras", unidos)
 
     async def test_dos_tramos_de_pausa_suman_35_y_se_muestran(self):
         state = self._poner(
